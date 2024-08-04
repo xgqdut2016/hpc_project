@@ -1,0 +1,107 @@
+#include <bang.h>
+
+#define EPS 1e-4
+#define NRAM_MAX_SIZE 102400
+const int maxNum = NRAM_MAX_SIZE/sizeof(float); //NRAM上最多存储maxNum个float元素
+__nram__ float src1[maxNum];//每次搬运maxNum数据到NRAM
+__nram__ float src2[maxNum];
+__nram__ float dest[maxNum];
+
+__mlu_entry__ void Kernel(float* dst, float* source1, float* source2, int num) {
+  
+  int remain = num%taskDim;//如果不能整除，则让前部分taskId多处理一个元素
+  int stepEasy = (num - remain)/taskDim;
+  int stepHard = stepEasy + 1;
+  int step = (taskId < remain ? stepHard : stepEasy);//前部分tsakId多处理一个元素
+  int indStart = (taskId < remain ? taskId * stepHard : remain * stepHard + (taskId - remain) * stepEasy);
+  int remainNram = step%maxNum;
+  int repeat = step/maxNum;//如果一个task处理元素个数超出NRAM最大内存，则需要for循环
+  
+  source1 = source1 + indStart;//设定起始偏移量
+  source2 = source2 + indStart;
+  dst = dst + indStart;
+  for(int i = 0; i < repeat; i++){
+    //printf("xiao:%d\n",i);
+    __memcpy(src1, source1, maxNum * sizeof(float), GDRAM2NRAM);
+    __memcpy(src2, source2, maxNum * sizeof(float), GDRAM2NRAM);
+    __bang_active_recip(src2, src2, maxNum);//计算倒数
+    __bang_mul(dest, src1, src2, maxNum);//倒数和另一个向量逐元素相乘得到除法结果
+    __memcpy(dst, dest, maxNum * sizeof(float), NRAM2GDRAM);
+    source1 = source1 + maxNum;
+    source2 = source2 + maxNum;
+    dst = dst + maxNum;
+
+  }
+  if(remainNram){
+    printf("taskId:%d,step:%d,remainNram:%d, maxNum:%d\n",taskId, step, remainNram, maxNum);
+    __memcpy(src1, source1, remainNram * sizeof(float), GDRAM2NRAM);
+    __memcpy(src2, source2, remainNram * sizeof(float), GDRAM2NRAM);
+    __bang_active_recip(src2, src2, remainNram);//计算倒数
+    __bang_mul(dest, src1, src2, remainNram);//倒数和另一个向量逐元素相乘得到除法结果
+    __memcpy(dst, dest, remainNram * sizeof(float), NRAM2GDRAM);
+  }
+  
+}
+
+int main(void)
+{
+  int num = 1020000;
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {4, 1, 1};
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;
+
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_dst = (float*)malloc(num * sizeof(float));
+  float* host_src1 = (float*)malloc(num * sizeof(float));
+  float* host_src2 = (float*)malloc(num * sizeof(float));
+
+  for (int i = 0; i < num; i++) {
+    host_src1[i] = 0.5;
+    host_src2[i] = 2.0;
+  }
+
+  float* mlu_dst;
+  float* mlu_src1;
+  float* mlu_src2;
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src1, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src2, num * sizeof(float)));
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src1, host_src1, num * sizeof(float), cnrtMemcpyHostToDev));
+  CNRT_CHECK(cnrtMemcpy(mlu_src2, host_src2, num * sizeof(float), cnrtMemcpyHostToDev));
+
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  Kernel<<<dim, ktype, queue>>>(mlu_dst, mlu_src1, mlu_src2, num);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+
+  cnrtQueueSync(queue);
+  CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, num * sizeof(float), cnrtMemcpyDevToHost));
+
+  for (int i = 0; i < num; i++) {
+    if (fabsf(host_dst[i] - float(0.25)) > EPS) {
+      printf("%f expected, but %f got!\n", float(0.25), host_dst[i]);
+    }
+  }
+
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_dst);
+  cnrtFree(mlu_src1);
+  cnrtFree(mlu_src2);
+  free(host_dst);
+  free(host_src1);
+  free(host_src2);
+
+  return 0;
+}
+

@@ -1,0 +1,127 @@
+#include <bang.h>
+#include <bang_device_functions.h>
+#define EPS 1e-7
+#define NRAM_MAX_SIZE 102400
+const int maxNum = NRAM_MAX_SIZE/sizeof(float); //NRAM上最多存储maxNum个float元素
+const int warpSize = 32;//__bang_reduce_sum每次从src取128字节数据相加，对应32个float元素,并且0-31的结果保存在索引0，32-63的结果保存在索引1
+
+__nram__ float src1[maxNum];//每次搬运maxNum数据到NRAM
+__nram__ float dest[maxNum];
+__nram__ float destFinal[maxNum];
+
+__mlu_entry__ void Kernel(float* dst, float* source1, int num) {
+  
+  int remain = num%taskDim;//如果不能整除，则让前部分taskId多处理一个元素
+  int stepEasy = (num - remain)/taskDim;
+  int stepHard = stepEasy + 1;
+  int step = (taskId < remain ? stepHard : stepEasy);//前部分tsakId多处理一个元素
+  int indStart = (taskId < remain ? taskId * stepHard : remain * stepHard + (taskId - remain) * stepEasy);
+  int remainNram = step%maxNum;
+  int repeat = step/maxNum;//如果一个task处理元素个数超出NRAM最大内存，则需要for循环
+  
+  source1 = source1 + indStart;//设定起始偏移量
+ 
+  
+  __bang_write_zero(destFinal, maxNum);//初始化destFinal全部元素为0
+  __bang_write_zero(dest, maxNum);//初始化dest全部元素为0
+  for(int i = 0; i < repeat; i++){
+    //__bang_printf("xiao:%d\n",i);
+    __memcpy(src1, source1, maxNum * sizeof(float), GDRAM2NRAM);
+    
+   
+    __bang_reduce_sum(dest, src1, maxNum);
+    
+    source1 = source1 + maxNum;
+    //__bang_printf("old,taskId:%d,iteration:%d,maxNum:%d,destFinal:%.2f,dest:%.2f\n",taskId,i,maxNum,destFinal[1],dest[0]);
+    __bang_add(destFinal, destFinal, dest, maxNum);
+    
+    //__bang_printf("new,taskId:%d,iteration:%d,maxNum:%d,destFinal:%.2f,dest:%.2f\n",taskId,i,maxNum,destFinal[0],dest[0]);
+    //__bang_write_zero(dest, maxNum);//初始化dest全部元素为0
+  }
+  if(remainNram){
+    
+    __bang_write_zero(dest, maxNum);//初始化dest全部元素为0
+    __bang_write_zero(src1, maxNum);//初始化src1全部元素为0
+    
+    __memcpy(src1, source1, remainNram * sizeof(float), GDRAM2NRAM);
+    
+    
+    __bang_reduce_sum(dest, src1, maxNum);//即便src1只有一部分非0，也要使用全部长度maxNum，不能使用remainNram
+    //__bang_printf("taskId:%d,step:%d,remainNram:%d, indStart:%d, maxNum:%d,dest:%.2f\n",taskId, step, remainNram, indStart,maxNum, dest[0]);
+    __bang_add(destFinal, destFinal, dest, maxNum);
+    
+  }
+  float sum = 0.0f;
+  for(int i = 0; i < maxNum; i++){
+    sum += destFinal[i]; 
+  }
+  dest[0] = sum;
+  
+  __memcpy(dst + taskId, dest, sizeof(float), NRAM2GDRAM);
+}
+
+int main(void)
+{
+  int num = 102;
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {4, 1, 1};
+  int taskNum = dim.x * dim.y * dim.z;
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;
+
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_dst = (float*)malloc(taskNum * sizeof(float));
+  float* host_src1 = (float*)malloc(num * sizeof(float));
+  
+
+  for (int i = 0; i < num; i++) {
+    host_src1[i] = 1e-1;
+    
+  }
+
+  float* mlu_dst;
+  float* mlu_src1;
+  
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, taskNum * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src1, num * sizeof(float)));
+ 
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src1, host_src1, num * sizeof(float), cnrtMemcpyHostToDev));
+  
+
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  Kernel<<<dim, ktype, queue>>>(mlu_dst, mlu_src1, num);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+
+  cnrtQueueSync(queue);
+  CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, taskNum * sizeof(float), cnrtMemcpyDevToHost));
+  float sum_s = 0;
+  for(int i = 0; i < taskNum; i++){
+    printf("dst[%d]=%.2f\n",i,host_dst[i]);
+    sum_s += host_dst[i];
+  }
+  if (fabsf(sum_s - float(num * 1e-1)) > EPS) {
+    printf("%f expected, but %f got!\n", float(num * 1e-1), sum_s);
+  }
+
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_dst);
+  cnrtFree(mlu_src1);
+  
+  free(host_dst);
+  free(host_src1);
+  
+
+  return 0;
+}
+

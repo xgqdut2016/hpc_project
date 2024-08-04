@@ -1,0 +1,76 @@
+#include <bang.h>//CUDA代码是加载cuda.h头文件
+
+#define EPS 1e-7
+#define LEN 1024
+
+__mlu_entry__ void Kernel(float* dst, float* source1, float* source2) {//CUDA的关键词是__global__
+  __nram__ float dest[LEN];
+  __nram__ float src1[LEN];
+  __nram__ float src2[LEN];
+  __memcpy(src1, source1, LEN * sizeof(float), GDRAM2NRAM);
+  __memcpy(src2, source2, LEN * sizeof(float), GDRAM2NRAM);
+  __bang_add(dest, src1, src2, LEN);//寒武纪编程没有threadIdx.x概念
+  __memcpy(dst, dest, LEN * sizeof(float), NRAM2GDRAM);
+}
+
+int main(void)
+{
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));//应该是指定代码执行设备
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {1, 1, 1};
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
+
+  cnrtNotifier_t start, end;//计算kernel执行时间，类似于cudaEvent_t
+  CNRT_CHECK(cnrtNotifierCreate(&start));//初始化时间，类似于cudaEventCreate(&start);
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_dst = (float*)malloc(LEN * sizeof(float));//CPU端开辟向量内存
+  float* host_src1 = (float*)malloc(LEN * sizeof(float));
+  float* host_src2 = (float*)malloc(LEN * sizeof(float));
+
+  for (int i = 0; i < LEN; i++) {
+    host_src1[i] = i;
+    host_src2[i] = i;//初始化CPU端向量元素
+  }
+
+  float* mlu_dst;
+  float* mlu_src1;
+  float* mlu_src2;
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, LEN * sizeof(float)));//在设备端开辟内存，类似于CUDA代码的cudaMalloc
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src1, LEN * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src2, LEN * sizeof(float)));
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src1, host_src1, LEN * sizeof(float), cnrtMemcpyHostToDev));//类似于cudaMemcpy函数
+  CNRT_CHECK(cnrtMemcpy(mlu_src2, host_src2, LEN * sizeof(float), cnrtMemcpyHostToDev));
+
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));//正式计时，类似于cudaEventRecord(start,0);
+  Kernel<<<dim, ktype, queue>>>(mlu_dst, mlu_src1, mlu_src2);//调用kernel函数
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));//结束计时，类似于cudaEventRecord(stop,0);
+
+  cnrtQueueSync(queue);//同步，任务内部的并行需要同步
+  CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, LEN * sizeof(float), cnrtMemcpyDevToHost));//把数据从设备转移回CPU
+
+  for (int i = 0; i < LEN; i++) {
+    if (fabsf(host_dst[i] - 2 * i) > EPS) {
+      printf("%f expected, but %f got!\n", (float)(2 * i), host_dst[i]);
+    }
+  }
+
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));//计算kernel时间，类似于cudaEventElapsedTime(&ker_time, start, stop);
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_dst);
+  cnrtFree(mlu_src1);
+  cnrtFree(mlu_src2);
+  free(host_dst);
+  free(host_src1);
+  free(host_src2);
+
+  return 0;
+}
+
