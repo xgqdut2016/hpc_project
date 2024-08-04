@@ -1,0 +1,173 @@
+#include <bang.h>
+#include <bang_device_functions.h>
+#define EPS 1e-7
+const int NRAM_MAX_SIZE = 1024 * 128;//后续树状求和必须保证NRAM_MAX_SIZE为2的幂次
+const int maxNum = NRAM_MAX_SIZE/sizeof(float); //NRAM上最多存储maxNum个float元素
+const int warpSize = 32;
+
+__mlu_entry__ void softmaxKernelAxis_e(float* destination, float* source, int othersize, int dimsize) {// axis = -1
+  __nram__ float src[maxNum];
+  __nram__ float destSum[maxNum];//后面数值求和
+  __nram__ float destSumFinal[warpSize];//将destSum规约到destFinal[0]
+  __nram__ float srcMax[2];
+  __nram__ float destOldMax;
+  __nram__ float destNewMax;
+
+  int remain = dimsize % maxNum;
+  int repeat = (dimsize - remain)/maxNum;
+  for(int otherIdx = taskId; otherIdx < othersize; otherIdx += taskDim){
+    int tid = otherIdx * dimsize;
+    destOldMax = -INFINITY;
+    destNewMax = -INFINITY;
+    __bang_write_zero(destSum, maxNum);
+    for(int i = 0; i < repeat; i++){
+      __memcpy(src, source + tid + i * maxNum, maxNum * sizeof(float), GDRAM2NRAM);
+      __bang_argmax(srcMax, src, maxNum);
+      if(destNewMax < srcMax[0]){
+        destNewMax = srcMax[0];//更新最大值
+      }
+      __bang_sub_scalar(src, src, destNewMax, maxNum);//src = src - 最大值
+      __bang_active_exp_less_0(src, src, maxNum);//src = exp(src - 最大值)
+      if(i > 0){
+        __bang_mul_scalar(destSum, destSum, exp(destOldMax - destNewMax), maxNum);
+      }
+      __bang_add(destSum, destSum, src, maxNum);
+      destOldMax = destNewMax;
+    }
+    //------------
+    if(remain){
+      __bang_write_value(src, maxNum, -INFINITY);//多余部分必须设置负无穷
+      __memcpy(src, source + tid + repeat * maxNum, remain * sizeof(float), GDRAM2NRAM);
+      
+      __bang_argmax(srcMax, src, maxNum);
+      if(destNewMax < srcMax[0]){
+        destNewMax = srcMax[0];
+      }
+      __bang_write_value(src, maxNum, destNewMax);//必须重新初始化为destNewMax
+      __memcpy(src, source + tid + repeat * maxNum, remain * sizeof(float), GDRAM2NRAM);
+      __bang_sub_scalar(src, src, destNewMax, maxNum);//后面maxNum-remain部分为0
+      __bang_active_exp_less_0(src, src, maxNum);//相当于多加了maxNum-remain
+      if(repeat > 0){
+        __bang_mul_scalar(destSum, destSum, exp(destOldMax - destNewMax), maxNum);
+      }
+      __bang_add(destSum, destSum, src, maxNum);
+      destOldMax = destNewMax;
+    }
+    //--------------
+    //--------------------------------
+    __bang_write_zero(destSumFinal, warpSize);
+    int segNum = maxNum / warpSize;
+    for(int strip = segNum/2; strip > 0; strip = strip / 2){
+      for(int i = 0; i < strip ; i++){
+        __bang_add(destSum + i * warpSize, destSum + i * warpSize, destSum + (i + strip) * warpSize, warpSize);
+      } 
+    }
+    __bang_reduce_sum(destSumFinal, destSum, warpSize);
+    
+    if(remain){
+      destSumFinal[0] = destSumFinal[0] - (maxNum - remain);
+    }
+    //-----------
+    float globalSumInv = 1.0/destSumFinal[0];
+    for(int i = 0; i < repeat; i++){
+      __memcpy(src, source + tid + i * maxNum, maxNum * sizeof(float), GDRAM2NRAM);
+      __bang_sub_scalar(src, src, destNewMax, maxNum); 
+      __bang_active_exp_less_0(src, src, maxNum);
+      __bang_mul_scalar(src, src, globalSumInv, maxNum);//倒数和另一个向量逐元素相乘得到除法结果
+      __memcpy(destination + tid + i * maxNum, src, maxNum * sizeof(float), NRAM2GDRAM);
+      
+    }
+    if(remain){
+      __bang_write_value(src, maxNum, destNewMax);
+      __memcpy(src, source + tid + repeat * maxNum, remain * sizeof(float), GDRAM2NRAM);
+      __bang_sub_scalar(src, src, destNewMax, maxNum);
+      __bang_active_exp_less_0(src, src, maxNum);
+      __bang_mul_scalar(src, src, globalSumInv, maxNum);//倒数和另一个向量逐元素相乘得到除法结果
+      __memcpy(destination + tid + repeat * maxNum, src, remain * sizeof(float), NRAM2GDRAM);
+    }
+  }
+  
+}
+
+
+int main(void)
+{
+  //int shape[4] = {1024,128,32,32};
+  //int shape[4] = {1024,64,32,32};
+  int shape[4] = {1024,32,32,32};
+  //int shape[4] = {2, 3, 2, 2};
+  int axis = 3;
+  int stride = 1;
+  int dimsize = shape[axis];
+  int num = 1;
+  int othersize = 1;
+  for(int s = 3; s >= 0; s--){
+    num *= shape[s];
+    if(s > axis){
+      stride *= shape[s];
+    }
+    if(s != axis){
+      othersize *= shape[s];
+    }
+  }
+  
+  printf("axis:%d, dimsize:%d, stride:%d, othersize:%d, num:%d\n", axis, dimsize, stride, othersize, num);
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {4, 1, 1};
+  int taskNum = dim.x * dim.y * dim.z;
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;
+
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_destination = (float*)malloc(num * sizeof(float));
+  float* host_src = (float*)malloc(num * sizeof(float));
+  
+
+  for (int i = 0; i < num; i++) {
+    //host_src[i] = i%4;
+    host_src[i] = i;
+  }
+
+  float* mlu_destination;
+  float* mlu_src;
+  
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_destination, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src, num * sizeof(float)));
+  
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, num * sizeof(float), cnrtMemcpyHostToDev));
+  
+  //----------------------------
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  softmaxKernelAxis_e<<<dim, ktype, queue>>>(mlu_destination, mlu_src, othersize, dimsize);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+  cnrtQueueSync(queue);
+
+  //---------------------------
+  CNRT_CHECK(cnrtMemcpy(host_destination, mlu_destination, num * sizeof(float), cnrtMemcpyDevToHost));
+  for(int i = 0; i < 24; i++){
+    printf("softmax[%d]:%.6e,origin:%.6f\n", i, host_destination[i], host_src[i]);
+  }
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_destination);
+  cnrtFree(mlu_src);
+  
+  
+  free(host_destination);
+  free(host_src);
+  
+
+  return 0;
+}
+                           
+

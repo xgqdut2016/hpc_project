@@ -1,0 +1,188 @@
+#include <bang.h>
+#include <bang_device_functions.h>
+#define EPS 1e-7
+const int NRAM_MAX_SIZE = 1024 * 128;//后续树状求和必须保证NRAM_MAX_SIZE为2的幂次
+const int maxNum = NRAM_MAX_SIZE/sizeof(float); //NRAM上最多存储maxNum个float元素
+const int warpSize = 32;//__bang_reduce_sum每次从src取128字节数据相加，对应32个float元素,并且0-31的结果保存在索引0，32-63的结果保存在索引1
+
+__nram__ float src[3 * maxNum];//后面GDRAM2NRAM，计算，NRAM2GDRAM三份数据
+__nram__ float destSum[maxNum];//后面数值求和
+__nram__ float destSumFinal[warpSize];//将destSum规约到destFinal[0]
+__nram__ float srcMax[2];
+
+__mlu_entry__ void softmaxKernel(float* dst, float* source, float* globalMax, float* globalSum, int num) {
+  
+  int remain = num%taskDim;//如果不能整除，则让前部分taskId多处理一个元素
+  int stepEasy = (num - remain)/taskDim;
+  int stepHard = stepEasy + 1;
+  int step = (taskId < remain ? stepHard : stepEasy);//前部分taskId多处理一个元素
+  int indStart = (taskId < remain ? taskId * stepHard : remain * stepHard + (taskId - remain) * stepEasy);
+  int remainNram = step%maxNum;
+  int repeat = step/maxNum;//如果一个task处理元素个数超出NRAM最大内存，则需要for循环
+  //maxNum尽量取大一些，免得repeat过大导致求和过程累加过于严重，使得大数吃小数
+  source = source + indStart;//设定起始偏移量
+
+  //------------------------------------下面开始计算max
+  __nram__ float destOldMax;
+  __nram__ float destNewMax;
+  __bang_write_zero(destSum, maxNum);
+  destNewMax = -INFINITY;//初始化为负无穷
+  for(int i = 0; i < repeat + 1; i++){
+    if(i < repeat){
+      __memcpy_async(src + i%2 * maxNum, source + i * maxNum, NRAM_MAX_SIZE, GDRAM2NRAM);
+    }
+    if(i > 0){
+      __bang_argmax(srcMax, src + (i - 1)%2 * maxNum, maxNum);
+      if(destNewMax < srcMax[0]){
+        destNewMax = srcMax[0];//更新最大值
+      }
+      __bang_sub_scalar(src + (i - 1)%2 * maxNum, src + (i - 1)%2 * maxNum, destNewMax, maxNum);//src = src - 最大值
+      __bang_active_exp_less_0(src + (i - 1)%2 * maxNum, src + (i - 1)%2 * maxNum, maxNum);//src = exp(src - 最大值)
+      if(i > 1){
+        __bang_mul_scalar(destSum, destSum, exp(destOldMax - destNewMax), maxNum);
+      }
+      __bang_add(destSum, destSum, src + (i - 1)%2 * maxNum, maxNum);//destSum = destSum + exp(src - destNewMax)
+      destOldMax = destNewMax;
+    }
+    __sync_all_ipu();
+  }
+  if(remainNram){
+    __bang_write_value(src, 3 * maxNum, -INFINITY);//必须要初始化src全部元素为负无穷
+    __memcpy(src, source + repeat * maxNum, remainNram * sizeof(float), GDRAM2NRAM);
+    __bang_argmax(srcMax, src, maxNum);//针对taskId处理的这step数据，借助于for循环把信息集中到长度为maxNum的向量src中
+    if(destNewMax < srcMax[0]){
+      destNewMax = srcMax[0];
+    }
+    __bang_write_value(src, 3 * maxNum, destNewMax);//必须重新初始化为destNewMax
+    __memcpy(src, source + repeat * maxNum, remainNram * sizeof(float), GDRAM2NRAM);//必须再次读取
+    __bang_sub_scalar(src, src, destNewMax, maxNum);//后面maxNum-remainNram部分为0
+    __bang_active_exp_less_0(src, src, maxNum);//相当于多加了maxNum-remainNram
+    if(repeat > 0){
+      __bang_mul_scalar(destSum, destSum, exp(destOldMax - destNewMax), maxNum);
+    }
+    __bang_add(destSum, destSum, src, maxNum);
+    destOldMax = destNewMax;
+  }//结束以后向量destNewMax保存了source[indSart:indStart+step]这部分数据的全局最大值,destSum保存数值和
+  //----------
+  __bang_write_zero(destSumFinal, warpSize);//初始化destSumFinal全部元素为0
+  int segNum = maxNum / warpSize;//将destSum分成segNum段，每段向量长度为warpSize，分段进行树状求和，segNum要求是2的幂次
+  for(int strip = segNum/2; strip > 0; strip = strip / 2){//segNum要求是2的幂次即maxNum必须选取2的幂次
+    for(int i = 0; i < strip ; i++){
+      __bang_add(destSum + i * warpSize, destSum + i * warpSize, destSum + (i + strip) * warpSize, warpSize);
+    } 
+  }
+  __bang_reduce_sum(destSumFinal, destSum, warpSize);
+  destSumFinal[0] = destSumFinal[0] - (maxNum - remainNram);//把上面多加的(maxNum - remainNram)减掉
+  
+  //----------
+  globalMax[0] = -INFINITY;
+  globalSum[0] = 0.0;
+  __sync_all();
+  __bang_atomic_max(&destNewMax, globalMax, &destNewMax, 1);//globalMax[0]必须初始化为负无穷
+  destSumFinal[0] = destSumFinal[0] * exp(destOldMax - globalMax[0]);
+  //__bang_printf("taskId:%d, step:%d, sum:%.6f\n", taskId, step, destSumFinal[0]);
+  __sync_all();
+  __bang_atomic_add(destSumFinal, globalSum, destSumFinal, 1);//globalSum[0]必须初始化为0
+  
+  
+  dst = dst + indStart;//设定起始偏移量
+  float globalSumInv = 1.0/globalSum[0];
+  
+  for(int i = 0; i < repeat + 2; i++){
+    if(i < repeat){
+      __memcpy_async(src + i%3 * maxNum, source + i * maxNum, NRAM_MAX_SIZE, GDRAM2NRAM);
+    }
+    if(i > 0 && i < repeat + 1){
+      __bang_sub_scalar(src + (i - 1)%3 * maxNum, src + (i - 1)%3 * maxNum, globalMax[0], maxNum);//src = src - globalMax[0] 
+      __bang_active_exp_less_0(src + (i - 1)%3 * maxNum, src + (i - 1)%3 * maxNum, maxNum);//src = exp(src - globalMax[0])
+      __bang_mul_scalar(src + (i - 1)%3 * maxNum, src + (i - 1)%3 * maxNum, globalSumInv, maxNum);
+    }
+    if(i > 1){
+      __memcpy_async(dst + (i - 2) * maxNum, src + (i - 2)%3 * maxNum, NRAM_MAX_SIZE, NRAM2GDRAM);
+    }
+    __sync_all_ipu();
+  }
+  
+  if(remainNram){ 
+    __bang_write_value(src, 3 * maxNum, globalMax[0]);
+    __memcpy(src, source + repeat * maxNum, remainNram * sizeof(float), GDRAM2NRAM);
+    __bang_sub_scalar(src, src, globalMax[0], maxNum);//src = src - globalMax[0] 
+    __bang_active_exp_less_0(src, src, maxNum);//src = exp(src - globalMax[0])
+    __bang_mul_scalar(src, src, globalSumInv, maxNum);//倒数和另一个向量逐元素相乘得到除法结果
+    __memcpy(dst + repeat * maxNum, src, remainNram * sizeof(float), NRAM2GDRAM);
+  }
+  
+  __bang_printf("taskId:%d,repeat:%d,max:%.6f, sum:%.6f\n",taskId, repeat, globalMax[0], globalSum[0]);
+  
+
+}
+
+
+int main(void)
+{
+  int num = 1024 * 1024 * 1024;
+  //int num = 11;
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {4, 1, 1};
+  int taskNum = dim.x * dim.y * dim.z;
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;
+
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_dst = (float*)malloc(num * sizeof(float));
+  float* host_src = (float*)malloc(num * sizeof(float));
+  
+
+  for (int i = 0; i < num; i++) {
+    host_src[i] = i%4;
+  }
+
+  float* mlu_dst;
+  float* mlu_src;
+  float* globalMax;
+  float* globalSum;
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_dst, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&globalMax, sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&globalSum, sizeof(float)));
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, num * sizeof(float), cnrtMemcpyHostToDev));
+  
+  //----------------------------
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  softmaxKernel<<<dim, ktype, queue>>>(mlu_dst, mlu_src, globalMax, globalSum, num);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+  cnrtQueueSync(queue);
+
+  //---------------------------
+  CNRT_CHECK(cnrtMemcpy(host_dst, mlu_dst, num * sizeof(float), cnrtMemcpyDevToHost));
+  for(int i = 0; i < 10; i++){
+    printf("softmax[%d]:%.6e,origin:%.6f\n", i, host_dst[i], host_src[i]);
+  }
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_dst);
+  cnrtFree(mlu_src);
+  cnrtFree(globalMax);
+  cnrtFree(globalSum);
+  
+  free(host_dst);
+  free(host_src);
+  
+
+  return 0;
+}
+
+
+
+
+

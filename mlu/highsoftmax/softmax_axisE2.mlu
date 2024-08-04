@@ -1,0 +1,308 @@
+#include <bang.h>
+#include <bang_device_functions.h>
+#define EPS 1e-7
+const int NRAM_MAX_SIZE = 1024 * 512;//the maximum NRAM memory is 1024 * 768
+const int nramNum = NRAM_MAX_SIZE/sizeof(float);
+__nram__  float nram_buffer[nramNum];
+const int SRC_MAX_SIZE = 1024 * 64;//The subsequent tree summation must ensure that SRC-MAX-SIZE is a power of 2
+//4 * SRC_MAX_SIZE must <= NRAM_MAX_SIZE
+const int maxNum = SRC_MAX_SIZE/sizeof(float); 
+const int wSize = 32;
+
+__mlu_device__ void softmaxKernelAxis_e(float* destination, float* source, int othersize, int dimsize, int dimS) {// axis = -1
+  __nram__ float destSumFinal[wSize];
+  __nram__ float srcMax[2];
+  __nram__ float destOldMax;
+  __nram__ float destNewMax;
+  if(dimsize >= maxNum){
+    float *src = nram_buffer;
+    float *destSum = src + 3 * maxNum;
+    
+    int remain = dimsize % maxNum;
+    int repeat = (dimsize - remain)/maxNum;
+
+    int otherRemain = othersize % taskDim;
+    int stepEasy = (othersize - otherRemain) / taskDim;
+    int stepHard = stepEasy + 1;
+    
+    int startHard = taskId * stepHard;
+    int startEasy = otherRemain * stepHard + (taskId - otherRemain) * stepEasy;
+    int indStart = (taskId < otherRemain ? startHard : startEasy);
+    source = source + indStart * dimsize;
+    destination = destination + indStart * dimsize;
+    
+    
+    destOldMax = -INFINITY;
+    destNewMax = -INFINITY;
+    __bang_write_zero(destSum, maxNum);
+    for(int i = 0; i < repeat + 1; i++){
+      if(i < repeat){
+        __memcpy_async(src + i % 2 * maxNum, source + i * maxNum, maxNum * sizeof(float), GDRAM2NRAM);
+      }
+      if(i > 0){
+        __bang_argmax(srcMax, src + (i - 1) % 2 * maxNum, maxNum);
+        if(destNewMax < srcMax[0]){
+          destNewMax = srcMax[0];
+        }
+        __bang_sub_scalar(src + (i - 1) % 2 * maxNum, src + (i - 1) % 2 * maxNum, destNewMax, maxNum);
+        __bang_active_exp_less_0(src + (i - 1) % 2 * maxNum, src + (i - 1) % 2 * maxNum, maxNum);
+        if(i > 1){
+          __bang_mul_scalar(destSum, destSum, exp(destOldMax - destNewMax), maxNum);
+        }
+        __bang_add(destSum, destSum, src + (i - 1) % 2 * maxNum, maxNum);
+        destOldMax = destNewMax;
+      }
+      __sync_all_ipu();
+    }
+    //------------
+    if(remain){
+      __bang_write_value(src, maxNum, -INFINITY);
+      __memcpy(src, source + repeat * maxNum, remain * sizeof(float), GDRAM2NRAM);
+      
+      __bang_argmax(srcMax, src, maxNum);
+      if(destNewMax < srcMax[0]){
+        destNewMax = srcMax[0];
+      }
+      __bang_write_value(src, maxNum, destNewMax);
+      __memcpy(src, source + repeat * maxNum, remain * sizeof(float), GDRAM2NRAM);
+      __bang_sub_scalar(src, src, destNewMax, maxNum);
+      __bang_active_exp_less_0(src, src, maxNum);
+      if(repeat > 0){
+        __bang_mul_scalar(destSum, destSum, exp(destOldMax - destNewMax), maxNum);
+      }
+      __bang_add(destSum, destSum, src, maxNum);
+      destOldMax = destNewMax;
+    }
+    //--------------
+    //--------------------------------
+    __bang_write_zero(destSumFinal, wSize);
+    int segNum = maxNum / wSize;
+    for(int strip = segNum/2; strip > 0; strip = strip / 2){
+      for(int i = 0; i < strip ; i++){
+        __bang_add(destSum + i * wSize, destSum + i * wSize, destSum + (i + strip) * wSize, wSize);
+      } 
+    }
+    __bang_reduce_sum(destSumFinal, destSum, wSize);
+    
+    if(remain){
+      destSumFinal[0] = destSumFinal[0] - (maxNum - remain);
+    }
+    //-----------
+    float globalSumInv = 1.0/destSumFinal[0];
+    for(int i = 0; i < repeat + 2; i++){
+      if(i < repeat){
+        __memcpy_async(src + i % 3 * maxNum, source + i * maxNum, maxNum * sizeof(float), GDRAM2NRAM);
+      }
+      if(i > 0 && i < repeat){
+        __bang_sub_scalar(src + (i - 1) % 3 * maxNum, src + (i - 1) % 3 * maxNum, destNewMax, maxNum); 
+        __bang_active_exp_less_0(src + (i - 1) % 3 * maxNum, src + (i - 1) % 3 * maxNum, maxNum);
+        __bang_mul_scalar(src + (i - 1) % 3 * maxNum, src + (i - 1) % 3 * maxNum, globalSumInv, maxNum);
+      }
+      if(i > 1){
+        __memcpy_async(destination + (i - 2) * maxNum, src + (i - 2) % 3 * maxNum, maxNum * sizeof(float), NRAM2GDRAM);
+      }
+      __sync_all_ipu();
+      
+    }
+    if(remain){
+      __bang_write_value(src, maxNum, destNewMax);
+      __memcpy(src, source + repeat * maxNum, remain * sizeof(float), GDRAM2NRAM);
+      __bang_sub_scalar(src, src, destNewMax, maxNum);
+      __bang_active_exp_less_0(src, src, maxNum);
+      __bang_mul_scalar(src, src, globalSumInv, maxNum);
+      __memcpy(destination + repeat * maxNum, src, remain * sizeof(float), NRAM2GDRAM);
+    }
+    
+  }
+  else{
+    int multiple = maxNum / dimsize;
+    int size = taskDim * multiple;
+    int remainS = othersize % size;
+    int taskRepeat = (othersize - remainS) / size;
+    int remainT = remainS % taskDim;
+    int stepEasy = (remainS - remainT) / taskDim;
+    int stepHard = stepEasy + 1;
+    int step = (taskId < remainT ? stepHard : stepEasy);
+    //The amount allocated for processing othersize for each taskId is taskRepeat * multiple+step
+    //Overall, the amount of data processed by each taskId is (taskRepeat * multiple+step) * dimsize
+    int startHard = taskId * (taskRepeat * multiple + stepHard);
+    int startEasy = remainT * (taskRepeat * multiple + stepHard) + (taskId - remainT) * (taskRepeat * multiple + stepEasy);
+    int indStart = (taskId < remainT ? startHard: startEasy);
+    source = source + indStart * dimsize;
+    destination = destination + indStart * dimsize;
+    
+    //-----------------------------------------allocate memory
+    float* src = nram_buffer;//src[maxNum]
+    float* tmp = src + 3 * maxNum;//tmp[dimS]
+    float* destSum = tmp + dimS;//destSum[dimS],dimS >= max(dimsize, wSize), dimS = pow(2,K) ,pow(2,K - 1) < dimsize
+    
+    //-----------------------------------------
+    //printf("taskId:%d, taskRepeat:%d, step:%d, repeatDim:%d, indstart:%d, %d\n", taskId, taskRepeat, step, repeatDim, indStart, indStart * dimsize);
+    int tid;
+    for(int s = 0; s < taskRepeat + 2; s++){
+      if(s < taskRepeat){
+        tid = s * multiple * dimsize;
+        __memcpy_async(src + s % 3 * maxNum, source + tid, multiple * dimsize * sizeof(float), GDRAM2NRAM);
+      }
+      if(s > 0 && s < taskRepeat + 1){
+        for(int j = 0; j < multiple; j++){
+          __bang_write_zero(destSum, dimS);
+          __bang_write_zero(destSumFinal, wSize);
+          __bang_write_value(tmp, dimS, -INFINITY);
+
+          __memcpy(tmp, src + (s - 1) %3 * maxNum + j * dimsize, dimsize * sizeof(float), NRAM2NRAM);
+          __bang_argmax(srcMax, tmp, dimS);
+          __bang_write_value(tmp, dimS, srcMax[0]);
+          __memcpy(tmp, src + (s - 1) %3 * maxNum + j * dimsize, dimsize * sizeof(float), NRAM2NRAM);
+          __bang_sub_scalar(tmp, tmp, srcMax[0], dimS);
+          __bang_active_exp_less_0(tmp, tmp, dimS);//tmp[dimsize:dimS] = exp(0)
+          __bang_add(destSum, destSum, tmp, dimS);
+          
+          int segNum = dimS / wSize;//Starting numerical summation
+          for(int strip = segNum/2; strip > 0; strip = strip / 2){
+            for(int i = 0; i < strip ; i++){
+              __bang_add(destSum + i * wSize, destSum + i * wSize, destSum + (i + strip) * wSize, wSize);
+            } 
+          }
+          __bang_reduce_sum(destSumFinal, destSum, wSize);//At this point, destSumFinal [0] saves the numerical value of the current dimsize length data sum
+          destSumFinal[0] = destSumFinal[0] - (dimS - dimsize);
+          //Now let's start writing back the data
+          float globalSumInv = 1.0/destSumFinal[0];
+          __bang_mul_scalar(tmp, tmp, globalSumInv, maxNum);
+          __memcpy(src + (s - 1) %3 * maxNum + j * dimsize, tmp, dimsize * sizeof(float), NRAM2NRAM);
+        }
+      }
+      if(s > 1){
+        tid = (s - 2) * multiple * dimsize;
+        __memcpy_async(destination + tid, src + (s - 2) % 3 * maxNum, multiple * dimsize * sizeof(float), NRAM2GDRAM);
+      }
+      __sync_all_ipu();
+      //it is necessary to write back to GDRAM immediately. If you first write back to src and then write back to GDRAM, 
+      //there may be a situation where src writes back to GDRAM before modifying the src data
+    }
+    for(int s = 0; s < step; s++){//Step targets parts of othersize that cannot be divided by multiple * dimsize
+      tid = taskRepeat * multiple * dimsize + s * dimsize;
+      __bang_write_zero(destSum, dimS);
+      __bang_write_zero(destSumFinal, wSize);
+      __bang_write_value(tmp, dimS, -INFINITY);
+      __memcpy(tmp, source + tid, dimsize * sizeof(float), GDRAM2NRAM);
+      
+      __bang_argmax(srcMax, tmp, dimS);
+      __bang_write_value(tmp, dimS, srcMax[0]);
+      __memcpy(tmp, source + tid, dimsize * sizeof(float), GDRAM2NRAM);
+      __bang_sub_scalar(tmp, tmp, srcMax[0], dimS);
+      
+      __bang_active_exp_less_0(tmp, tmp, dimS);
+      __bang_add(destSum, destSum, tmp, dimS);
+      
+      int segNum = dimS / wSize;
+      for(int strip = segNum/2; strip > 0; strip = strip / 2){
+        for(int i = 0; i < strip ; i++){
+          __bang_add(destSum + i * wSize, destSum + i * wSize, destSum + (i + strip) * wSize, wSize);
+        }
+      }
+      __bang_reduce_sum(destSumFinal, destSum, wSize);
+      destSumFinal[0] = destSumFinal[0] - (dimS - dimsize);
+      //__bang_printf(":%.2f,max:%.2f, sum:%.2f, final:%.2f\n",tmp[1], srcMax[0], destSum[1], destSumFinal[0]);
+      float globalSumInv = 1.0/destSumFinal[0];
+      __bang_mul_scalar(tmp, tmp, globalSumInv, maxNum);
+      __memcpy(destination + tid, tmp, dimsize * sizeof(float), NRAM2GDRAM);
+      
+    } 
+  }
+}
+__mlu_global__ void softmaxUnion1(float *mlu_destination, float *mlu_src, int othersize, int dimsize){
+  int dimS;
+  float mi = log2(dimsize);
+  if(floor(mi) == mi){
+    dimS = dimsize;
+  }
+  else{
+    dimS = pow(2,floor(mi) + 1);
+  }
+  if(dimS < wSize){
+    dimS = wSize;
+  }
+  softmaxKernelAxis_e(mlu_destination, mlu_src, othersize, dimsize, dimS);
+  
+}
+
+int main(void)
+{
+  int shape[4] = {1024,1024, 1, 1024};
+  
+  int axis = 3;
+  int stride = 1;
+  int dimsize = shape[axis];
+  int num = 1;
+  int othersize = 1;
+  for(int s = 3; s >= 0; s--){
+    num *= shape[s];
+    if(s > axis){
+      stride *= shape[s];
+    }
+    if(s != axis){
+      othersize *= shape[s];
+    }
+  }
+  
+  printf("axis:%d, dimsize:%d, stride:%d, othersize:%d, num:%d\n", axis, dimsize, stride, othersize, num);
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {16, 1, 1};
+  int taskNum = dim.x * dim.y * dim.z;
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;
+
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_destination = (float*)malloc(num * sizeof(float));
+  float* host_src = (float*)malloc(num * sizeof(float));
+  
+
+  for (int i = 0; i < num; i++) {
+    //host_src[i] = i%4;
+    host_src[i] = i;
+  }
+
+  float* mlu_destination;
+  float* mlu_src;
+  
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_destination, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src, num * sizeof(float)));
+  
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, num * sizeof(float), cnrtMemcpyHostToDev));
+  
+  //----------------------------
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  softmaxUnion1<<<dim, ktype, queue>>>(mlu_destination, mlu_src, othersize, dimsize);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+  cnrtQueueSync(queue);
+
+  //---------------------------
+  CNRT_CHECK(cnrtMemcpy(host_destination, mlu_destination, num * sizeof(float), cnrtMemcpyDevToHost));
+  
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_destination);
+  cnrtFree(mlu_src);
+  
+  
+  free(host_destination);
+  free(host_src);
+  
+
+  return 0;
+}
+                           
+
+                           
+

@@ -1,0 +1,184 @@
+#include <bang.h>
+#include <bang_device_functions.h>
+#define EPS 1e-7
+const int NRAM_MAX_SIZE = 1024 * 128;//后续树状求和必须保证NRAM_MAX_SIZE为2的幂次
+const int maxNum = NRAM_MAX_SIZE/sizeof(float); //NRAM上最多存储maxNum个float元素
+
+//strideS是大于等于stride的最小的二的幂次方
+template<int strideS>
+__mlu_entry__ void softmaxKernelAxis_m(float* destination, float* source, int frontsize, int dimsize, int stride) {
+  // 0<axis<dim -1 
+  __nram__ float src[maxNum];
+  __nram__ float tmp[strideS];
+  __nram__ float tmpOldMax[strideS];
+  __nram__ float tmpNewMax[strideS];
+  __nram__ float tmpSum[strideS];
+  if(dimsize * stride >= maxNum){
+    int multiple = maxNum / stride;
+    int size = multiple * stride;//一个src最多可以放的数据量
+    int remain = dimsize % multiple;//如果不能整除，这部分数据需要特殊处理
+    int repeat = (dimsize - remain) / multiple;//为了加载整个dimsize需要的循环总数
+    printf("maxNum:%d, dimsize * stride:%d, multiple:%d, size:%d, repeat:%d,remain:%d\n",maxNum, dimsize * stride, multiple, size, repeat,remain);
+    for(int ind = taskId; ind < frontsize; ind += taskDim){
+      int frontIdx = ind * dimsize * stride;
+      
+      __bang_write_value(tmpNewMax, strideS, -INFINITY);//必须初始化为负无穷
+      __bang_write_value(tmp, strideS, -INFINITY);//必须初始化为负无穷
+      __bang_write_zero(tmpSum, strideS);//必须初始化为0
+      
+      for(int j = 0; j < repeat; j++){
+        __memcpy(src, source + frontIdx + j * multiple * stride, size * sizeof(float), GDRAM2NRAM);
+        for(int m = 0; m < multiple; m++){
+          __memcpy(tmp, src + m * stride, stride * sizeof(float), NRAM2NRAM);
+          
+          __bang_maxequal(tmpNewMax, tmpNewMax, tmp, strideS);//虽然tmpNewMax后面strideS-stride部分是0，但是不用写回GDRAM，不影响结果
+          
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);//tmp后面strideS-stride部分是0
+          __bang_active_exp_less_0(tmp, tmp, strideS);
+          if(j != 0 || m != 0){
+            __bang_sub(tmpOldMax, tmpOldMax, tmpNewMax, strideS);//oldM = oldM - newM
+            __bang_active_exp_less_0(tmpOldMax, tmpOldMax, strideS);//exp(oldM - newM)
+            __bang_mul(tmpSum, tmpSum, tmpOldMax, strideS);//sum = sum * exp(oldM - newM)
+          }
+          __bang_add(tmpSum, tmpSum, tmp, strideS);//sum += exp(x - M)
+          //if(m == 0) __bang_printf("tmp:%.2f, tmpMax[0]:%.2f,tmpSum[0]:%.2f\n", tmp[1], tmpNewMax[1],tmpSum[0]);
+          __memcpy(tmpOldMax, tmpNewMax, stride * sizeof(float), NRAM2NRAM);//oldM = newM
+        }
+      }
+      //__bang_printf("tmpOldMax[0]:%.2f,tmpSum[0]:%.2f\n", tmpNewMax[0],tmpSum[0]);
+      if(remain){
+        __memcpy(src, source + frontIdx + repeat * multiple * stride, remain * stride * sizeof(float), GDRAM2NRAM);
+        for(int m = 0; m < remain; m++){
+          __memcpy(tmp, src + m * stride, stride * sizeof(float), NRAM2NRAM);
+          __bang_maxequal(tmpNewMax, tmpNewMax, tmp, strideS);
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);//tmp后面strideS-stride部分是0
+          __bang_active_exp_less_0(tmp, tmp, strideS);
+          if(repeat != 0 || m != 0){
+            __bang_sub(tmpOldMax, tmpOldMax, tmpNewMax, strideS);//oldM = oldM - newM
+            __bang_active_exp_less_0(tmpOldMax, tmpOldMax, strideS);//exp(oldM - newM)
+            __bang_mul(tmpSum, tmpSum, tmpOldMax, strideS);//sum = sum * exp(oldM - newM)
+          }
+          __bang_add(tmpSum, tmpSum, tmp, strideS);//sum += exp(x - M)
+          __memcpy(tmpOldMax, tmpNewMax, stride * sizeof(float), NRAM2NRAM);//oldM = newM
+        }
+      }
+      
+      //此时tmpNewMax存储的是对应于固定frontIdx，behindsize对应数据的最大值，而tmpSum存储的就是对应数值和
+      //__bang_printf("tmpOldMax[0]:%.2f,tmpSum[0]:%.2f\n", tmpNewMax[2],tmpSum[2]);
+      __bang_active_recip(tmpSum, tmpSum, strideS);
+      //__bang_printf("tmpOldMax[0]:%.2f,tmpSum[0]:%.2f\n", tmpNewMax[2],tmpSum[2]);
+      if(remain){
+        for(int m = 0; m < remain; m++){
+          __memcpy(tmp, src + m * stride, stride * sizeof(float), NRAM2NRAM);
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);
+          __bang_active_exp_less_0(tmp, tmp, strideS);
+          __bang_mul(tmp, tmp, tmpSum, strideS);
+          __memcpy(destination + frontIdx + repeat * multiple * stride + m * stride, tmp, stride * sizeof(float), NRAM2GDRAM);
+        }
+        
+      }
+      for(int j = 0 ; j < repeat; j++){
+        __memcpy(src, source + frontIdx + j * multiple * stride, size * sizeof(float), GDRAM2NRAM);
+        for(int m = 0; m < multiple; m++){
+          __memcpy(tmp, src + m * stride, stride * sizeof(float), NRAM2NRAM);
+          
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);
+          __bang_active_exp_less_0(tmp, tmp, strideS);
+          __bang_mul(tmp, tmp, tmpSum, strideS);
+          __memcpy(destination + frontIdx + j * multiple * stride + m * stride, tmp, stride * sizeof(float), NRAM2GDRAM);
+        }
+      }
+    }
+
+  }
+  
+  
+}
+
+
+int main(void)
+{
+  //int shape[4] = {1024,128,32,32};
+  //int shape[4] = {1024,64,32,32};
+  int shape[4] = {1024,32,32,32};
+  //int shape[4] = {2, 3, 2, 2};
+  int axis = 1;
+  int stride = 1;
+  int dimsize = shape[axis];
+  int num = 1;
+  int othersize = 1;
+  int frontsize = 1;
+  ;
+  for(int s = 3; s >= 0; s--){
+    num *= shape[s];
+    if(s > axis){
+      stride *= shape[s];
+    }
+    if(s < axis){
+      frontsize *= shape[s];
+    }
+    if(s != axis){
+      othersize *= shape[s];
+    }
+  }
+  
+  printf("axis:%d, dimsize:%d, stride:%d, othersize:%d, frontsize:%d, num:%d\n", axis, dimsize, stride, othersize, frontsize, num);
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {4, 1, 1};
+  int taskNum = dim.x * dim.y * dim.z;
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;
+
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_destination = (float*)malloc(num * sizeof(float));
+  float* host_src = (float*)malloc(num * sizeof(float));
+  
+
+  for (int i = 0; i < num; i++) {
+    //host_src[i] = i%4;
+    host_src[i] = i;
+  }
+
+  float* mlu_destination;
+  float* mlu_src;
+  
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_destination, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src, num * sizeof(float)));
+  
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, num * sizeof(float), cnrtMemcpyHostToDev));
+  
+  //----------------------------
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  softmaxKernelAxis_m<1024><<<dim, ktype, queue>>>(mlu_destination, mlu_src, frontsize, dimsize, stride);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+  cnrtQueueSync(queue);
+
+  //---------------------------
+  CNRT_CHECK(cnrtMemcpy(host_destination, mlu_destination, num * sizeof(float), cnrtMemcpyDevToHost));
+  for(int i = 0; i < 24; i++){
+    printf("softmax[%d]:%.6e,origin:%.6f\n", i, host_destination[i], host_src[i]);
+  }
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_destination);
+  cnrtFree(mlu_src);
+  
+  
+  free(host_destination);
+  free(host_src);
+  
+
+  return 0;
+}
+                           
+

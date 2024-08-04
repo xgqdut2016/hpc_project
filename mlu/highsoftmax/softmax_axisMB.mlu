@@ -1,0 +1,196 @@
+#include <bang.h>
+#include <bang_device_functions.h>
+#define EPS 1e-7
+const int NRAM_MAX_SIZE = 1024 * 128;//后续树状求和必须保证NRAM_MAX_SIZE为2的幂次
+const int maxNum = NRAM_MAX_SIZE/sizeof(float); //NRAM上最多存储maxNum个float元素
+
+//strideS是大于等于stride的最小的二的幂次方
+template<int strideS>
+__mlu_entry__ void softmaxKernelAxis_m(float* destination, float* source, int frontsize, int dimsize, int stride) {
+  // 0<axis<dim -1 
+  __nram__ float src[maxNum];
+  __nram__ float tmp[strideS];
+  __nram__ float tmpOldMax[strideS];
+  __nram__ float tmpNewMax[strideS];
+  __nram__ float tmpSum[strideS];
+  if(dimsize * stride < maxNum){
+    int behindsize = dimsize * stride;
+    int multiple = maxNum / behindsize;//表示一个maxNum能够在frontsize中分担的量
+    int size = multiple * behindsize;//一个taskId中一个src能够加载的数据量
+    int remainF = frontsize % (taskDim * multiple);
+    int remainT = remainF % taskDim;
+    int stepEasy = (remainF - remainT) / taskDim;
+    int stepHard = stepEasy + 1;
+    int step = (taskId < remainT ? stepHard : stepEasy);
+    int taskRepeat = (frontsize - remainF) / (taskDim * multiple);
+    //此时对应于frontsize，每个taskId处理的数据量是taskRepeat * multiple + step
+    int startHard = taskId * (taskRepeat * multiple + stepHard);
+    int startEasy = remainT * (taskRepeat * multiple + stepHard) + (taskId - remainT) * (taskRepeat * multiple + stepEasy);
+    int indStart = (taskId < remainT ? startHard: startEasy);
+    source = source + indStart * behindsize;//indStart * behindsize表示不同taskId对应的偏移量
+    destination = destination + indStart * behindsize;
+    int tid;
+    for(int s = 0; s < taskRepeat; s++){
+      tid = s * multiple * behindsize;
+      __memcpy(src, source + tid, multiple * behindsize * sizeof(float), GDRAM2NRAM);
+      for(int m = 0; m < multiple; m++){
+        __bang_write_zero(tmpSum, strideS);
+        __bang_write_value(tmp, strideS, -INFINITY);
+        __bang_write_value(tmpNewMax, strideS, -INFINITY);
+        for(int i = 0; i < dimsize; i++){
+          __memcpy(tmp, src + m * behindsize + i * stride, stride * sizeof(float), NRAM2NRAM);
+          __bang_maxequal(tmpNewMax, tmpNewMax, tmp, strideS);
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);//x - M
+          __bang_active_exp_less_0(tmp, tmp, strideS);//exp(x - M)
+          if(i > 0){
+            __bang_sub(tmpOldMax, tmpOldMax, tmpNewMax, strideS);//oldM = oldM - newM
+            __bang_active_exp_less_0(tmpOldMax, tmpOldMax, strideS);//exp(oldM - newM)
+            __bang_mul(tmpSum, tmpSum, tmpOldMax, strideS);      //sum = sum * exp(oldM - newM)
+          }
+          __bang_add(tmpSum, tmpSum, tmp, strideS);//sum += exp(x - M)
+          __memcpy(tmpOldMax, tmpNewMax, stride * sizeof(float), NRAM2NRAM);//oldM = newM
+        }
+        __bang_active_recip(tmpSum, tmpSum, strideS);
+        __bang_mul(tmp, tmp, tmpSum, strideS);//上面循环结束tmp存储的数据可以利用
+        //__memcpy(destination + tid + m * behindsize + (dimsize - 1) * stride, tmp, stride * sizeof(float), NRAM2GDRAM);
+        __memcpy(src + m * behindsize + (dimsize - 1) * stride, tmp, stride * sizeof(float), NRAM2NRAM);
+        for(int i = 0; i < dimsize - 1; i++){
+          __memcpy(tmp, src + m * behindsize + i * stride, stride * sizeof(float), NRAM2NRAM);
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);//x - M
+          __bang_active_exp_less_0(tmp, tmp, strideS);//exp(x - M)
+          __bang_mul(tmp, tmp, tmpSum, strideS);
+          //__memcpy(destination + tid + m * behindsize + i * stride, tmp, stride * sizeof(float), NRAM2GDRAM);
+          __memcpy(src + m * behindsize + i * stride, tmp, stride * sizeof(float), NRAM2NRAM);
+        }
+      }
+      __memcpy(destination + tid, src, multiple * behindsize * sizeof(float), NRAM2GDRAM);
+    }
+    __bang_printf("taskId:%d, multiple:%d, taskRepeat:%d, step:%d, indStart:%d\n",taskId, multiple, taskRepeat, step, indStart * behindsize);
+    if(step){
+      tid = taskRepeat * multiple * behindsize; 
+      __memcpy(src, source + tid, step * behindsize * sizeof(float), GDRAM2NRAM);
+      for(int m = 0; m < step; m++){
+        __bang_write_zero(tmpSum, strideS);
+        __bang_write_value(tmp, strideS, -INFINITY);
+        __bang_write_value(tmpNewMax, strideS, -INFINITY);
+        for(int i = 0; i < dimsize; i++){
+          __memcpy(tmp, src + m * behindsize + i * stride, stride * sizeof(float), NRAM2NRAM);
+          __bang_maxequal(tmpNewMax, tmpNewMax, tmp, strideS);
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);//x - M
+          __bang_active_exp_less_0(tmp, tmp, strideS);//exp(x - M)
+          if(i > 0){
+            __bang_sub(tmpOldMax, tmpOldMax, tmpNewMax, strideS);//oldM = oldM - newM
+            __bang_active_exp_less_0(tmpOldMax, tmpOldMax, strideS);//exp(oldM - newM)
+            __bang_mul(tmpSum, tmpSum, tmpOldMax, strideS);      //sum = sum * exp(oldM - newM)
+          }
+          __bang_add(tmpSum, tmpSum, tmp, strideS);//sum += exp(x - M)
+          __memcpy(tmpOldMax, tmpNewMax, stride * sizeof(float), NRAM2NRAM);//oldM = newM
+        }
+        //__bang_printf("max:%.2f,%.2f, sum:%.2f,sum:%.2f\n", tmpNewMax[0], tmpNewMax[1], tmpSum[0], tmpSum[0]);
+        __bang_active_recip(tmpSum, tmpSum, strideS);
+        __bang_mul(tmp, tmp, tmpSum, strideS);//上面循环结束tmp存储的数据可以利用
+        //__memcpy(destination + tid + m * behindsize + (dimsize - 1) * stride, tmp, stride * sizeof(float), NRAM2GDRAM);
+        __memcpy(src + m * behindsize + (dimsize - 1) * stride, tmp, stride * sizeof(float), NRAM2NRAM);
+        for(int i = 0; i < dimsize - 1; i++){
+          __memcpy(tmp, src + m * behindsize + i * stride, stride * sizeof(float), NRAM2NRAM);
+          __bang_sub(tmp, tmp, tmpNewMax, strideS);//x - M
+          __bang_active_exp_less_0(tmp, tmp, strideS);//exp(x - M)
+          __bang_mul(tmp, tmp, tmpSum, strideS);
+          //__memcpy(destination + tid + m * behindsize + i * stride, tmp, stride * sizeof(float), NRAM2GDRAM);
+          __memcpy(src + m * behindsize + i * stride, tmp, stride * sizeof(float), NRAM2NRAM);
+        }
+      }
+      __memcpy(destination + tid, src, step * behindsize * sizeof(float), NRAM2GDRAM);
+    }
+  }
+  
+  
+}
+
+
+int main(void)
+{
+  //int shape[4] = {1024,128,32,32};
+  //int shape[4] = {1024,64,32,32};
+  int shape[4] = {1024,32,32,32};
+  //int shape[4] = {2, 3, 2, 2};
+  int axis = 2;
+  int stride = 1;
+  int dimsize = shape[axis];
+  int num = 1;
+  int othersize = 1;
+  int frontsize = 1;
+  ;
+  for(int s = 3; s >= 0; s--){
+    num *= shape[s];
+    if(s > axis){
+      stride *= shape[s];
+    }
+    if(s < axis){
+      frontsize *= shape[s];
+    }
+    if(s != axis){
+      othersize *= shape[s];
+    }
+  }
+  
+  printf("axis:%d, dimsize:%d, stride:%d, othersize:%d, frontsize:%d, num:%d\n", axis, dimsize, stride, othersize, frontsize, num);
+  cnrtQueue_t queue;
+  CNRT_CHECK(cnrtSetDevice(0));
+  CNRT_CHECK(cnrtQueueCreate(&queue));
+
+  cnrtDim3_t dim = {4, 1, 1};
+  int taskNum = dim.x * dim.y * dim.z;
+  cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_UNION1;
+
+  cnrtNotifier_t start, end;
+  CNRT_CHECK(cnrtNotifierCreate(&start));
+  CNRT_CHECK(cnrtNotifierCreate(&end));
+
+  float* host_destination = (float*)malloc(num * sizeof(float));
+  float* host_src = (float*)malloc(num * sizeof(float));
+  
+
+  for (int i = 0; i < num; i++) {
+    //host_src[i] = i%4;
+    host_src[i] = i;
+  }
+
+  float* mlu_destination;
+  float* mlu_src;
+  
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_destination, num * sizeof(float)));
+  CNRT_CHECK(cnrtMalloc((void**)&mlu_src, num * sizeof(float)));
+  
+
+  CNRT_CHECK(cnrtMemcpy(mlu_src, host_src, num * sizeof(float), cnrtMemcpyHostToDev));
+  
+  //----------------------------
+  CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+  softmaxKernelAxis_m<1024><<<dim, ktype, queue>>>(mlu_destination, mlu_src, frontsize, dimsize, stride);
+  CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+  cnrtQueueSync(queue);
+
+  //---------------------------
+  CNRT_CHECK(cnrtMemcpy(host_destination, mlu_destination, num * sizeof(float), cnrtMemcpyDevToHost));
+  for(int i = 0; i < 24; i++){
+    printf("softmax[%d]:%.6e,origin:%.6f\n", i, host_destination[i], host_src[i]);
+  }
+  float timeTotal;
+  CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+  printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+  CNRT_CHECK(cnrtQueueDestroy(queue));
+
+  cnrtFree(mlu_destination);
+  cnrtFree(mlu_src);
+  
+  
+  free(host_destination);
+  free(host_src);
+  
+
+  return 0;
+}
+                           
+
