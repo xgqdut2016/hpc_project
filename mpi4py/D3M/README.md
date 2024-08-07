@@ -5,4 +5,4 @@ mpiexec -n 4 python poisson.py --para 1
 
 kflow.py：区域分解求解kflow方程
 
-代码链接参考\urf{https://blog.csdn.net/forrestguang/article/details/129696869}
+代码链接参考\url{https://blog.csdn.net/forrestguang/article/details/129696869}
