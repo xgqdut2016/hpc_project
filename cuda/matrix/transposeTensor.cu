@@ -74,8 +74,8 @@ __device__ void wmmaBlock(float *dA, float *dB, float *dC, int indA, int indB, i
 
     // Initialize the output to zero
     wmma::fill_fragment(c_frag, 0.0f);
-    int aRow = indA + warpIdx * WMMA_M;
-    int bCol = indB + warpIdy * WMMA_N;
+    int bCol = indB + warpIdx * WMMA_M;
+    int aRow = indA + warpIdy * WMMA_N;
     int width = (K + WMMA_K - 1) / WMMA_K;
     for (int i = 0; i < width; i++)
     {
@@ -100,8 +100,8 @@ __device__ void wmmaBlock(float *dA, float *dB, float *dC, int indA, int indB, i
 }
 __global__ void wmmaRowMatmul(float *dA, float *dB, float *dC, int M, int K, int N)
 {
-    int indA = blockIdx.x * warpX * WMMA_M;
-    int indB = blockIdx.y * warpY * WMMA_N;
+    int indB = blockIdx.x * warpX * WMMA_M;
+    int indA = blockIdx.y * warpY * WMMA_N;
     wmmaBlock(dA, dB, dC, indA, indB, M, K, N);
 }
 __global__ void tranKernel(float *dB, int N, int d)
@@ -233,4 +233,3 @@ int main()
     free(serialC);
     return 0;
 }
-
