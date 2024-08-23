@@ -1,0 +1,290 @@
+#include "bang.h"
+#include "bang_device_functions.h"
+#include "cnrt.h"
+const int NRAM_MAX_SIZE = 1024 * 256;
+
+
+const int SRC_MAX_SIZE = 1024 * 16;//至少大于等于128字节
+__nram__  char nram_buffer[NRAM_MAX_SIZE];
+
+template <typename T>
+__mlu_global__ void rotaryEmbeddingDim_3(T *destination, int *pos, float theta, int stride_0, int stride_1, int nt, int nh, int dimsize) {//axis=-1
+
+    const int maxNum = SRC_MAX_SIZE/sizeof(T);
+    int dh = dimsize / 2;
+    T dh_inv = 1.0 / dh;
+    int othersize = nt * nh;
+
+    int segsize = sizeof(T);
+    int srcStrideL = 2 * sizeof(T);
+    int destStrideL = 1 * sizeof(T);
+    
+    int srcStrideW = 1 * sizeof(T);
+    int destStrideW = 2 * sizeof(T);
+
+    int remainT = othersize % taskDim;
+    int stepEasy = (othersize - remainT) / taskDim;
+    int stepHard = stepEasy + 1;
+    int step = (taskId < remainT ? stepHard : stepEasy);
+    int indStart = (taskId < remainT ? taskId * stepHard : (taskId - remainT) * stepEasy + remainT * stepHard);
+
+    if(nt < maxNum){
+        char *nram_buffer1 = nram_buffer + nt * sizeof(int);
+        int *srcP = (int *)nram_buffer;
+
+        __memcpy(srcP, pos, nt * sizeof(int), GDRAM2NRAM);
+        
+        if(dimsize >= maxNum){
+            T *srcK = (T *)nram_buffer1;//[maxNum]
+            for(int i = 0; i < maxNum; i++){
+                srcK[i] = i;
+            }
+            int segnum = 2 * maxNum;
+            T *src = srcK + maxNum;//[2maxNum]
+            T *srcJ = src + 2 * maxNum;//[2maxNum]
+            T *srcO = srcJ + maxNum;//[2maxNum]
+            T *freq = srcO + maxNum;//[maxNum]
+            T *sinF = freq + maxNum;
+            T *cosF = sinF + maxNum;
+            T *srca = cosF + maxNum;
+            T *srcb = srca + maxNum;
+            int remain = dimsize % (2 * maxNum);
+            int repeat = (dimsize - remain) /  (2 * maxNum);
+            for(int i = indStart; i < indStart + step; i++){
+                int indd = 0;
+                int indi = i;
+                indd += (indi % nh) * stride_1;
+                indi /= nh;
+                indd += (indi % nt) * stride_0;
+
+                T posData = srcP[indi];
+                for(int s = 0; s < repeat; s++){
+                    __bang_add_scalar(freq, srcK, s * maxNum, maxNum);//freq = s * maxNum + i
+                    __bang_mul_scalar(freq, freq, dh_inv, maxNum);//freq = freq / dh
+                    __bang_mul_scalar(freq, freq, log(theta), maxNum);//freq = freq * log(theta)
+                    __bang_active_exp(freq, freq, maxNum);//freq = exp(freq)
+                    __bang_active_recip(freq, freq, maxNum);//freq = 1/freq
+                    __bang_mul_scalar(freq, freq, posData, maxNum);
+
+                    __bang_active_sin(sinF, freq, maxNum);
+                    __bang_active_cos(cosF, freq, maxNum);
+
+                    __memcpy(src, destination + indd + s * 2 * maxNum, 2 * maxNum * sizeof(T), GDRAM2NRAM);
+                    __memcpy(srcb, src + 1, segsize, NRAM2NRAM, destStrideL, srcStrideL, segnum);     
+                    __memcpy(srca, src, segsize, NRAM2NRAM, destStrideL, srcStrideL, segnum); 
+
+                    __bang_mul(srcO, srca, cosF, maxNum);// srcO = a * cos
+                    __bang_mul(freq, srcb, sinF, maxNum);//freq = b * sin
+                    __bang_mul_scalar(freq, freq, -1.0, maxNum);
+                    __bang_add(srcO, srcO, freq, maxNum);//srcO = a * cos - b * sin
+
+                    __bang_mul(srcJ, srca, sinF, maxNum);//srcJ = a * sin
+                    __bang_mul(freq, srcb, cosF, maxNum);//freq = b * cos
+                    __bang_add(srcJ, srcJ, freq, maxNum);
+
+                    __memcpy(src, srcO, segsize, NRAM2NRAM, destStrideW, srcStrideW, segnum);
+                    __memcpy(src + 1, srcJ, segsize, NRAM2NRAM, destStrideW, srcStrideW, segnum);
+                    __memcpy(destination + indd + s * 2 * maxNum, src, 2 * maxNum * sizeof(T), NRAM2GDRAM);
+
+                    
+                }
+                if(remain){
+                    //int fracRemain = remain / 2;
+                    
+                    __bang_add_scalar(freq, srcK, repeat * maxNum, maxNum);//freq = s * maxNum + i
+                    __bang_mul_scalar(freq, freq, dh_inv, maxNum);//freq = freq / dh
+                    __bang_mul_scalar(freq, freq, log(theta), maxNum);//freq = freq * log(theta)
+                    __bang_active_exp(freq, freq, maxNum);//freq = exp(freq)
+                    __bang_active_recip(freq, freq, maxNum);//freq = 1/freq
+                    __bang_mul_scalar(freq, freq, posData, maxNum);
+
+                    __bang_active_sin(sinF, freq, maxNum);
+                    __bang_active_cos(cosF, freq, maxNum);
+
+                    __memcpy(src, destination + indd + repeat * 2 * maxNum, remain * sizeof(T), GDRAM2NRAM);
+                    __memcpy(srcb, src + 1, segsize, NRAM2NRAM, destStrideL, srcStrideL, remain);     
+                    __memcpy(srca, src, segsize, NRAM2NRAM, destStrideL, srcStrideL, remain); 
+
+                    __bang_mul(srcO, srca, cosF, maxNum);// srcO = a * cos
+                    __bang_mul(freq, srcb, sinF, maxNum);//freq = b * sin
+                    __bang_mul_scalar(freq, freq, -1.0, maxNum);
+                    __bang_add(srcO, srcO, freq, maxNum);//srcO = a * cos - b * sin
+
+                    __bang_mul(srcJ, srca, sinF, maxNum);//srcJ = a * sin
+                    __bang_mul(freq, srcb, cosF, maxNum);//freq = b * cos
+                    __bang_add(srcJ, srcJ, freq, maxNum);
+
+                    __memcpy(src, srcO, segsize, NRAM2NRAM, destStrideW, srcStrideW, remain);
+                    __memcpy(src + 1, srcJ, segsize, NRAM2NRAM, destStrideW, srcStrideW, remain);
+                    __memcpy(destination + indd, src, remain * sizeof(T), NRAM2GDRAM);
+
+                    
+                }
+            }
+            
+        }
+        else{
+            //__bang_printf("xiao\n");
+            T *srcK = (T *)nram_buffer1;//[dh]
+            for(int i = 0; i < dh; i++){
+                srcK[i] = i;
+            }
+            int segnum = dimsize;
+            T *src = srcK + dh;//[dimsize]
+            T *srcJ = src + dimsize;//[dh]
+            T *srcO = srcJ + dh;//[dh]
+            T *freq = srcO + dh;//[dh]
+            T *srca = freq + dh;
+            T *srcb = srca + dh;
+            T *sinF = srcb + 3 * dh;//由于srcb的memcpy有stride，这里尽量放大srcb的内存>2dh
+            T *cosF = sinF + dh;
+            
+            for(int i = indStart; i < indStart + step; i++){
+                int indd = 0;
+                int indi = i;
+                indd += (indi % nh) * stride_1;
+                indi /= nh;
+                indd += (indi % nt) * stride_0;
+
+                T posData = srcP[indi];
+                
+                __bang_mul_scalar(freq, srcK, dh_inv, dh);//freq = srcK / dh
+                __bang_mul_scalar(freq, freq, log(theta), dh);//freq = freq * log(theta)
+                __bang_active_exp(freq, freq, dh);//freq = exp(freq)
+                __bang_active_recip(freq, freq, dh);//freq = 1/freq
+                __bang_mul_scalar(freq, freq, posData, dh);
+
+                __bang_active_sin(sinF, freq, dh);
+                __bang_active_cos(cosF, freq, dh);
+                
+                
+                
+                __memcpy(src, destination + indd, dimsize * sizeof(T), GDRAM2NRAM);
+                __memcpy(srca, src, segsize, NRAM2NRAM, destStrideL, srcStrideL, segnum); 
+                __memcpy(srcb, src + 1, segsize, NRAM2NRAM, destStrideL, srcStrideL, segnum);     
+                
+                __bang_mul(srcO, srca, cosF, dh);// srcO = a * cos
+                __bang_mul(freq, srcb, sinF, dh);//freq = b * sin
+                __bang_mul_scalar(freq, freq, -1.0, dh);
+                __bang_add(srcO, srcO, freq, dh);//srcO = a * cos - b * sin
+                
+                __bang_mul(srcJ, srca, sinF, dh);//srcJ = a * sin
+                __bang_mul(freq, srcb, cosF, dh);//freq = b * cos
+                __bang_add(srcJ, srcJ, freq, dh);
+                
+                
+                __memcpy(src, srcO, segsize, NRAM2NRAM, destStrideW, srcStrideW, segnum);
+                __memcpy(src + 1, srcJ, segsize, NRAM2NRAM, destStrideW, srcStrideW, segnum);
+                __memcpy(destination + indd, src, dimsize * sizeof(T), NRAM2GDRAM);
+            }
+            
+
+        }
+    }
+    
+}
+template<typename T>
+void rotaryEmbeddingUnionDim_3(cnrtQueue_t queue, T *destination,  int *pos, float theta, int stride_0, int stride_1, int nt, int nh, int dimsize) {
+    
+    
+    
+    cnrtDim3_t k_dim;
+    cnrtFunctionType_t k_type;
+
+    k_dim.x = 4;
+    k_dim.y = 1;
+    k_dim.z = 1;
+    k_type = CNRT_FUNC_TYPE_UNION1;
+
+    rotaryEmbeddingDim_3<T><<<k_dim, k_type, queue>>>(destination, pos, theta, stride_0, stride_1, nt, nh, dimsize);
+    cnrtQueueSync(queue);
+    
+}
+
+
+int main(void)
+{
+    int nt = 1;
+    int nh = 4;
+    int dimsize = 8;
+    int num = nt * nh * dimsize;
+    int stride_0 = nh * dimsize;
+    int stride_1 = dimsize;
+    float theta = 1e4;
+
+    half *host_source = (half*)malloc(num * sizeof(half));
+    int *host_pos = (int*)malloc(nt * sizeof(int));
+    
+    for(int i = 0; i < num; i++){
+        host_source[i] = i;
+    }
+    for(int i = 0; i < num; i++){
+        printf("%.4f ", host_source[i]);
+        if((i + 1) % dimsize == 0){
+            printf("\n");
+        }
+    }
+    printf("\n");
+    for(int i = 0; i < num; i++){
+        host_pos[i] = 1;
+    }
+    
+    cnrtQueue_t queue;
+    CNRT_CHECK(cnrtSetDevice(0));
+    CNRT_CHECK(cnrtQueueCreate(&queue));
+
+    
+    cnrtNotifier_t start, end;
+    CNRT_CHECK(cnrtNotifierCreate(&start));
+    CNRT_CHECK(cnrtNotifierCreate(&end));
+
+    half* mlu_source;
+    int* mlu_pos;
+    
+    CNRT_CHECK(cnrtMalloc((void**)&mlu_source, num * sizeof(half)));
+    CNRT_CHECK(cnrtMalloc((void**)&mlu_pos, nt * sizeof(int)));
+    
+
+    CNRT_CHECK(cnrtMemcpy(mlu_source, host_source, num * sizeof(half), cnrtMemcpyHostToDev));
+    CNRT_CHECK(cnrtMemcpy(mlu_pos, host_pos, nt * sizeof(int), cnrtMemcpyHostToDev));
+    
+    //----------------------------
+    CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+    rotaryEmbeddingUnionDim_3<half>(queue, mlu_source, mlu_pos, theta, stride_0, stride_1, nt, nh, dimsize);
+    
+    CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+    cnrtQueueSync(queue);
+
+    //---------------------------
+    CNRT_CHECK(cnrtMemcpy(host_source, mlu_source, num * sizeof(half), cnrtMemcpyDevToHost));
+    
+    float timeTotal;
+    CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+    printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+    CNRT_CHECK(cnrtQueueDestroy(queue));
+
+    
+    for(int i = 0; i < num; i++){
+        printf("%.4f ", host_source[i]);
+        if((i + 1) % dimsize == 0){
+            printf("\n");
+        }
+    }
+    printf("\n");
+    cnrtFree(mlu_source);
+    cnrtFree(mlu_pos);
+    
+    
+    free(host_source);
+    free(host_pos);
+
+    return 0;
+}     
+
+
+
+
+
+
+

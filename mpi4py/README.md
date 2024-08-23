@@ -2,3 +2,16 @@
 
 mpiexec -n 4 python mpi_hello.py
 
+## base
+该文件夹存放的是mpi4py的一些基本代码
+
+## D3M
+该文件夹存放的是mpi4py处理区域分解的深度学习求解PDE代码
+
+## pnnpde
+该文件夹存放的是mpi4py处理含参PDE求解的代码
+
+## burgers
+该文件夹存放的是mpi4py处理burgers方程的代码
+
+代码相关说明可以参考https://blog.csdn.net/forrestguang/article/details/130036270

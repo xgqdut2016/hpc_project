@@ -1,0 +1,542 @@
+#include "bang.h"
+#include "bang_device_functions.h"
+#include "cnrt.h"
+const int NRAM_MAX_SIZE = 1024 * 256;
+
+
+const int SRC_MAX_SIZE = 8 * sizeof(half);
+__nram__  char nram_buffer[NRAM_MAX_SIZE];
+
+template <typename T>
+__mlu_global__ void random_sampleX(T *source, int *indices, int *indGdram, T *globalTopk, T *globalSum, float topp, int topk, float temperature, int voc){
+    const int maxNum = SRC_MAX_SIZE/sizeof(T);
+    int wSize = 128 / sizeof(T);
+    int segNum = maxNum / wSize;
+
+    T temInv = 1.0 / static_cast<T>(temperature);
+
+    int remainT = voc % taskDim;
+    int stepEasy = (voc - remainT) / taskDim;
+    int stepHard = stepEasy + 1;
+    int step = (taskId < remainT ? stepHard : stepEasy);
+    int indStart = (taskId < remainT ? taskId * stepHard : remainT * stepHard + (taskId - remainT) * stepEasy);
+
+    char *nram_bufferInd = nram_buffer + (2 * maxNum + wSize + taskDim * topk) * sizeof(T);
+    int *srcInd = (int *)nram_bufferInd;//[maxNum],必须要求maxNum >= max{step, topk}
+    int *indGlobal = srcInd + maxNum;//[taskDim * topk]
+    
+    __sync_all();
+    
+    T *src = (T *)nram_buffer;//[maxNum],必须要求maxNum >= max{step, topk}
+    T *destSum = src + maxNum;//[maxNum]
+    T *destSumFinal = destSum + maxNum;//[wSize]
+    T *srcGlobal = destSumFinal + wSize;//[taskDim * topk]
+    __bang_write_value(src, maxNum, -INFINITY);
+    __bang_write_zero(destSum, maxNum);
+    __bang_write_zero(destSumFinal, wSize);
+
+    __memcpy(srcInd, indGdram, voc * sizeof(int), GDRAM2NRAM);
+    //__bang_printf("taskId:%d, indStart:%d, step:%d, maxNum:%d, topk:%d\n", taskId, indStart, step, maxNum, topk);
+    if(step){
+        for(int i = 0; i < step; i++){
+            srcInd[i] = indStart + i;
+        }
+        __memcpy(src, source + indStart, step * sizeof(T), GDRAM2NRAM);
+        if(step >= topk){
+            for(int i = 0; i < topk; i++){  
+                for(int j = i + 1; j < step; j++){
+                    if(src[i] < src[j]){
+                        T tmp = src[i];
+                        src[i] = src[j];
+                        src[j] = tmp;
+
+                        int indexTmp = srcInd[i];
+                        srcInd[i] = srcInd[j];
+                        srcInd[j] = indexTmp;
+                    }
+                }
+            }
+        }
+        else{
+            for(int i = step; i < topk; i++){
+                src[i] = -INFINITY;
+                srcInd[i] = -1;
+            }
+        }
+        __memcpy(globalTopk + taskId * topk, src, topk * sizeof(T), NRAM2GDRAM);
+        __memcpy(indGdram + taskId * topk, srcInd, topk * sizeof(int), NRAM2GDRAM);
+        __sync_all();
+    }
+    if(taskId == 0){
+        __memcpy(srcGlobal, globalTopk, taskDim * topk * sizeof(T), GDRAM2NRAM);
+        __memcpy(indGlobal, indGdram, taskDim * topk * sizeof(int), GDRAM2NRAM);
+        for(int i = 0; i < topk; i++){
+            for(int j = i + 1; j < taskDim * topk; j++){
+                if(srcGlobal[i] < srcGlobal[j]){
+                    T tmpg = srcGlobal[i];
+                    srcGlobal[i] = srcGlobal[j];
+                    srcGlobal[j] = tmpg;
+
+                    int indexTmpg = indGlobal[i];
+                    indGlobal[i] = indGlobal[j];
+                    indGlobal[j] = indexTmpg;
+                }
+            }
+        }
+        __memcpy(globalTopk, srcGlobal, taskDim * topk * sizeof(T), NRAM2GDRAM);
+        __memcpy(indGdram, indGlobal, taskDim * topk * sizeof(int), NRAM2GDRAM);
+    }
+    __sync_all();
+    T globalM = globalTopk[0];
+    __bang_write_zero(destSum, maxNum);
+    __bang_write_zero(destSumFinal, wSize);
+    if(step){
+        __bang_write_value(src, maxNum, globalM);
+        __memcpy(src, source + indStart, step * sizeof(T), GDRAM2NRAM);
+        __bang_sub_scalar(src, src, globalM, maxNum);
+        __bang_mul_scalar(src, src, temInv, maxNum);
+        __bang_active_exp_less_0(src, src, maxNum);
+        __bang_add(destSum, destSum, src, maxNum);
+    }
+    if(maxNum >= wSize){
+        for(int strip = segNum/2; strip > 0; strip = strip / 2){//segNum要求是2的幂次即maxNum必须选取2的幂次
+            for(int i = 0; i < strip ; i++){
+                __bang_add(destSum + i * wSize, destSum + i * wSize, destSum + (i + strip) * wSize, wSize);
+            } 
+        }
+        
+        __bang_reduce_sum(destSumFinal, destSum, wSize);
+    }
+    else{
+        for(int i = 0; i < maxNum; i++){
+            destSumFinal[0] += destSum[i];
+        }
+    }
+    if(step){
+        destSumFinal[0] = destSumFinal[0] - (maxNum - step);//把上面多加的(maxNum - step)减掉
+    }
+    globalSum[0] = 0.0;
+    
+    __sync_all();
+    __bang_atomic_add(destSumFinal, globalSum, destSumFinal, 1);//globalSum[0]必须初始化为0
+    //__bang_printf("taskId:%d, %.4e\n", taskId, globalSum[0]);
+    T globalSumInv = 1.0 / globalSum[0];//计算出全局数值和
+    if(step){
+        __bang_mul_scalar(src, src, globalSumInv, maxNum);
+        __memcpy(source + indStart, src, step * sizeof(T), NRAM2GDRAM);
+    }
+    if(taskId == 0){
+        __memcpy(srcGlobal, globalTopk, topk * sizeof(T), GDRAM2NRAM);//前topk个元素就是前k个最大值
+        
+
+        __bang_sub_scalar(srcGlobal, srcGlobal, globalM, topk);
+        __bang_mul_scalar(srcGlobal, srcGlobal, temInv, topk);
+        __bang_active_exp_less_0(srcGlobal, srcGlobal, topk);
+        __bang_mul_scalar(srcGlobal, srcGlobal, globalSumInv, topk);
+        
+        __bang_write_zero(destSum, maxNum);
+        destSum[0] = srcGlobal[0];
+        for(int i = 1; i < topk; i++){
+            destSum[i] = destSum[i - 1] + srcGlobal[i];
+        }
+        
+        int end = 0;
+        for(end = 0; end < topk; end++){
+            if(destSum[end] >= static_cast<T>(topp)){
+                break;
+            }
+        }
+        if(end < topk - 1){
+            end += 1;
+        }
+        else{
+            end = topk;
+        }
+        T randomVal = 0.75;
+        randomVal *= destSum[end - 1];
+        for(int i = 0; i < end; i++){
+            if(randomVal < destSum[i]){
+                indices[0] = indGdram[i];
+                break;
+            }
+        }
+        __memcpy(globalTopk, srcGlobal, topk * sizeof(T), NRAM2GDRAM);
+    }
+}
+template <typename T>
+__mlu_global__ void random_sampleD(T *source, int *indices, int *indGdram, T *globalTopk, T *globalSum, float topp, int topk, float temperature, int voc){
+    const int maxNum = SRC_MAX_SIZE/sizeof(T);
+    
+    int wSize = 128 / sizeof(T);
+    int segNum = maxNum / wSize;
+
+    T temInv = 1.0 / static_cast<T>(temperature);
+    int taskSize = taskDim * maxNum;
+    int remain = voc % taskSize;
+    int repeat = (voc - remain) / taskSize;
+
+    int remainT = remain % taskDim;
+    int stepEasy = (remain - remainT) / taskDim;
+    int stepHard = stepEasy + 1;
+    int step = (taskId < remainT ? stepHard : stepEasy);
+    int indStart = (taskId < remainT ? taskId * stepHard : remainT * stepHard + (taskId - remainT) * stepEasy);
+    
+    char *nram_bufferInd = nram_buffer + (2 * maxNum + wSize + 2 * topk + taskDim * topk) * sizeof(T);
+    int *srcInd = (int *)nram_bufferInd;//[maxNum]
+    int *topkInd = srcInd + maxNum;//[2 * topk]
+    int *indGlobal = topkInd + 2 * topk;
+    __bang_write_zero(topkInd, 2 * topk);
+
+    T *src = (T *)nram_buffer;//[maxNum]
+    T *srcTopk = src + maxNum;//[2 * topk]
+    T *destSum = srcTopk + 2 * topk;//[maxNum]
+    T *destSumFinal = destSum + maxNum;//[wSize]
+    T *srcGlobal = destSumFinal + wSize;//[taskDim * topk]
+    __bang_write_value(srcTopk, 2 * topk, -INFINITY);
+    for(int r = 0; r < repeat; r++){
+        for(int j = 0; j < maxNum; j++){
+            srcInd[j] = r * taskSize + taskId * maxNum + j;
+        }
+        __memcpy(src, source + r * taskSize + taskId * maxNum, maxNum * sizeof(T), GDRAM2NRAM);
+        for(int i = 0; i < topk; i++){  
+            for(int j = i + 1; j < maxNum; j++){
+                if(src[i] < src[j]){
+                    T tmp = src[i];
+                    src[i] = src[j];
+                    src[j] = tmp;
+
+                    int indexTmp = srcInd[i];
+                    srcInd[i] = srcInd[j];
+                    srcInd[j] = indexTmp;
+                }
+            }
+            srcTopk[topk + i] = src[i];
+            topkInd[topk + i] = srcInd[i];
+        }
+        if(r == 0){
+            __memcpy(srcTopk, srcTopk + topk, topk * sizeof(T), NRAM2NRAM);
+            __memcpy(topkInd, topkInd + topk, topk * sizeof(int), NRAM2NRAM);
+        }
+        else{
+            for(int i = 0; i < topk; i++){
+                for(int j = i + 1; j < 2 * topk; j++){
+                    if(srcTopk[i] < srcTopk[j]){
+                        T tmpk = srcTopk[i];
+                        srcTopk[i] = srcTopk[j];
+                        srcTopk[j] = tmpk;
+
+                        int indexTmpk = topkInd[i];
+                        topkInd[i] = topkInd[j];
+                        topkInd[j] = indexTmpk;
+                    }
+                }
+            }
+        }
+        
+        
+    }
+    
+    if(step){
+        for(int j = 0; j < step; j++){
+            srcInd[j] = repeat * taskSize + indStart + j;
+        }
+        __memcpy(src, source + repeat * taskSize + indStart, step * sizeof(T), GDRAM2NRAM);
+        if(step >= topk){
+            for(int i = 0; i < topk; i++){  
+                for(int j = i + 1; j < step; j++){
+                    if(src[i] < src[j]){
+                        T tmp = src[i];
+                        src[i] = src[j];
+                        src[j] = tmp;
+
+                        int indexTmp = srcInd[i];
+                        srcInd[i] = srcInd[j];
+                        srcInd[j] = indexTmp;
+                    }
+                }
+                srcTopk[topk + i] = src[i];
+                topkInd[topk + i] = srcInd[i];
+            }
+            for(int i = 0; i < topk; i++){
+                for(int j = i + 1; j < 2 * topk; j++){
+                    if(srcTopk[i] < srcTopk[j]){
+                        T tmpk = srcTopk[i];
+                        srcTopk[i] = srcTopk[j];
+                        srcTopk[j] = tmpk;
+
+                        int indexTmpk = topkInd[i];
+                        topkInd[i] = topkInd[j];
+                        topkInd[j] = indexTmpk;
+                    }
+                }
+            }
+        }
+        else{
+            for(int i = 0; i < step; i++){
+                srcTopk[topk + i] = src[i];
+                topkInd[topk + i] = srcInd[i];
+            }
+            for(int i = 0; i < topk; i++){
+                for(int j = i + 1; j < 2 * topk; j++){
+                    if(srcTopk[i] < srcTopk[j]){
+                        T tmpk = srcTopk[i];
+                        srcTopk[i] = srcTopk[j];
+                        srcTopk[j] = tmpk;
+
+                        int indexTmpk = topkInd[i];
+                        topkInd[i] = topkInd[j];
+                        topkInd[j] = indexTmpk;
+                    }
+                }
+            }
+        }
+    }
+    
+    __memcpy(globalTopk + taskId * topk, srcTopk, topk * sizeof(T), NRAM2GDRAM);
+    __memcpy(indGdram + taskId * topk, topkInd, topk * sizeof(int), NRAM2GDRAM);
+    __sync_all();
+    
+    if(taskId == 0){
+        __memcpy(srcGlobal, globalTopk, taskDim * topk * sizeof(T), GDRAM2NRAM);
+        __memcpy(indGlobal, indGdram, taskDim * topk * sizeof(int), GDRAM2NRAM);
+        for(int i = 0; i < topk; i++){
+            for(int j = i + 1; j < taskDim * topk; j++){
+                if(srcGlobal[i] < srcGlobal[j]){
+                    T tmpg = srcGlobal[i];
+                    srcGlobal[i] = srcGlobal[j];
+                    srcGlobal[j] = tmpg;
+
+                    int indexTmpg = indGlobal[i];
+                    indGlobal[i] = indGlobal[j];
+                    indGlobal[j] = indexTmpg;
+                }
+            }
+        }
+        __memcpy(globalTopk, srcGlobal, taskDim * topk * sizeof(T), NRAM2GDRAM);
+        __memcpy(indGdram, indGlobal, taskDim * topk * sizeof(int), NRAM2GDRAM);
+    }
+    __sync_all();
+    //下面开始做类似于softmax变换
+    T globalM = globalTopk[0];
+    __bang_write_zero(destSum, maxNum);
+    __bang_write_zero(destSumFinal, wSize);
+    for(int r = 0; r < repeat; r++){
+        __memcpy(src, source + r * taskSize + taskId * maxNum, maxNum * sizeof(T), GDRAM2NRAM);
+        __bang_sub_scalar(src, src, globalM, maxNum);
+        __bang_mul_scalar(src, src, temInv, maxNum);
+        __bang_active_exp_less_0(src, src, maxNum);
+        __bang_add(destSum, destSum, src, maxNum);
+    }
+    if(step){
+        __bang_write_value(src, maxNum, globalM);
+        __memcpy(src, source + repeat * taskSize + indStart, step * sizeof(T), GDRAM2NRAM);
+        __bang_sub_scalar(src, src, globalM, maxNum);
+        __bang_mul_scalar(src, src, temInv, maxNum);
+        __bang_active_exp_less_0(src, src, maxNum);
+        __bang_add(destSum, destSum, src, maxNum);
+    }
+    if(maxNum >= wSize){
+        for(int strip = segNum/2; strip > 0; strip = strip / 2){//segNum要求是2的幂次即maxNum必须选取2的幂次
+            for(int i = 0; i < strip ; i++){
+                __bang_add(destSum + i * wSize, destSum + i * wSize, destSum + (i + strip) * wSize, wSize);
+            } 
+        }
+        
+        __bang_reduce_sum(destSumFinal, destSum, wSize);
+    }
+    
+    else{
+        for(int i = 0; i < maxNum; i++){
+            
+            destSumFinal[0] += destSum[i];
+        }
+        
+    }
+    if(step){
+        destSumFinal[0] = destSumFinal[0] - (maxNum - step);//把上面多加的(maxNum - step)减掉
+    }
+    globalSum[0] = 0.0;
+    
+    __sync_all();
+    __bang_atomic_add(destSumFinal, globalSum, destSumFinal, 1);//globalSum[0]必须初始化为0
+    //__bang_printf("taskId:%d, %.4e\n", taskId, globalSum[0]);
+    T globalSumInv = 1.0 / globalSum[0];//计算出全局数值和
+    /***
+    if(step){
+        __bang_mul_scalar(src, src, globalSumInv, maxNum);
+        __memcpy(source + repeat * taskSize + indStart, src, step * sizeof(T), NRAM2GDRAM);
+    }
+    for(int r = 0; r < repeat; r++){
+        __memcpy(src, source + r * taskSize + taskId * maxNum, maxNum * sizeof(T), GDRAM2NRAM);
+        __bang_sub_scalar(src, src, globalM, maxNum);
+        __bang_mul_scalar(src, src, temInv, maxNum);
+        __bang_active_exp_less_0(src, src, maxNum);
+        __bang_mul_scalar(src, src, globalSumInv, maxNum);
+        __memcpy(source + r * taskSize + taskId * maxNum, src, maxNum * sizeof(T), NRAM2GDRAM);
+    }
+    ***/
+    if(taskId == 0){
+        __memcpy(srcGlobal, globalTopk, topk * sizeof(T), GDRAM2NRAM);//前topk个元素就是前k个最大值
+        
+
+        __bang_sub_scalar(srcGlobal, srcGlobal, globalM, topk);
+        __bang_mul_scalar(srcGlobal, srcGlobal, temInv, topk);
+        __bang_active_exp_less_0(srcGlobal, srcGlobal, topk);
+        __bang_mul_scalar(srcGlobal, srcGlobal, globalSumInv, topk);
+        
+        __bang_write_zero(srcTopk, 2 * topk);
+        srcTopk[0] = srcGlobal[0];
+        for(int i = 1; i < topk; i++){
+            srcTopk[i] = srcTopk[i - 1] + srcGlobal[i];
+        }
+        
+        int end = 0;
+        for(end = 0; end < topk; end++){
+            if(srcTopk[end] >= static_cast<T>(topp)){
+                break;
+            }
+        }
+        if(end < topk - 1){
+            end += 1;
+        }
+        else{
+            end = topk;
+        }
+        T randomVal = 0.75;
+        randomVal *= srcTopk[end - 1];
+        for(int i = 0; i < end; i++){
+            if(randomVal < srcTopk[i]){
+                indices[0] = indGdram[i];
+                break;
+            }
+        }
+        __memcpy(globalTopk, srcGlobal, topk * sizeof(T), NRAM2GDRAM);
+    }
+}
+
+template<typename T>
+void random_sampleUnion(cnrtQueue_t queue, T *source, int *indices, float topp, int topk, float temperature, int voc) {
+    
+    cnrtDim3_t k_dim;
+    cnrtFunctionType_t k_type;
+
+    k_dim.x = 4;
+    k_dim.y = 1;
+    k_dim.z = 1;
+    k_type = CNRT_FUNC_TYPE_UNION1;
+    
+    int taskNum = k_dim.x * k_dim.y * k_dim.z;
+    const int maxNum = SRC_MAX_SIZE/sizeof(T);
+    int *indGdram;
+    CNRT_CHECK(cnrtMalloc((void**)&indGdram, taskNum * topk * sizeof(int)));
+    T *globalTopk;
+    CNRT_CHECK(cnrtMalloc((void**)&globalTopk, taskNum * topk * sizeof(T)));
+    T *globalSum;
+    CNRT_CHECK(cnrtMalloc((void**)&globalSum, sizeof(T)));
+
+    if(voc >= taskNum * maxNum){
+        random_sampleD<T><<<k_dim, k_type, queue>>>(source, indices, indGdram, globalTopk, globalSum, topp, topk, temperature, voc);
+    }
+    else{
+        random_sampleX<T><<<k_dim, k_type, queue>>>(source, indices, indGdram, globalTopk, globalSum, topp, topk, temperature, voc);
+    }
+    cnrtQueueSync(queue);
+
+    T *Tmpt = (T *)malloc(taskNum * topk * sizeof(T));
+    CNRT_CHECK(cnrtMemcpy(Tmpt, globalTopk, taskNum * topk * sizeof(T), cnrtMemcpyDevToHost));
+    for(int i = 0; i < taskNum * topk; i++){
+        printf("%.2f ", Tmpt[i]);
+    }
+    printf("\n");
+    free(Tmpt);
+    int *Tmpi = (int *)malloc(taskNum * topk * sizeof(int));
+    CNRT_CHECK(cnrtMemcpy(Tmpi, indGdram, taskNum * topk * sizeof(int), cnrtMemcpyDevToHost));
+    for(int i = 0; i < taskNum * topk; i++){
+        printf("%d ", Tmpi[i]);
+    }
+    printf("\n");
+    free(Tmpi);
+
+    T *Tmp = (T *)malloc(voc * sizeof(T));
+    T sum_s = 0;
+    CNRT_CHECK(cnrtMemcpy(Tmp, source, voc * sizeof(T), cnrtMemcpyDevToHost));
+    for(int i = 0; i < voc; i++){
+        sum_s += Tmp[i];
+        printf("%.2e ", Tmp[i]);
+    }
+    printf("\n");
+    printf("%.2e\n", sum_s);
+    free(Tmp);
+
+    cnrtFree(indGdram);
+    cnrtFree(globalTopk);
+    cnrtFree(globalSum);
+}
+
+
+int main(void)
+{
+    int voc = 14;
+    float topp = 0.9;
+    int topk = 4;
+    float temperature = 2.0;
+    half *host_source = (half*)malloc(voc * sizeof(half));
+    int* host_indices = (int*)malloc(sizeof(int));
+    
+    for(int i = 0; i < voc; i++){
+        host_source[i] = i;
+    }
+    
+    cnrtQueue_t queue;
+    CNRT_CHECK(cnrtSetDevice(0));
+    CNRT_CHECK(cnrtQueueCreate(&queue));
+
+    
+    cnrtNotifier_t start, end;
+    CNRT_CHECK(cnrtNotifierCreate(&start));
+    CNRT_CHECK(cnrtNotifierCreate(&end));
+
+    half* mlu_source;
+    int* mlu_indices;
+    
+    CNRT_CHECK(cnrtMalloc((void**)&mlu_source, voc * sizeof(half)));
+    CNRT_CHECK(cnrtMalloc((void**)&mlu_indices, sizeof(int)));
+    
+
+    CNRT_CHECK(cnrtMemcpy(mlu_source, host_source, voc * sizeof(half), cnrtMemcpyHostToDev));
+    
+    //----------------------------
+    CNRT_CHECK(cnrtPlaceNotifier(start, queue));
+    random_sampleUnion<half>(queue, mlu_source, mlu_indices, topp, topk, temperature, voc);
+    
+    CNRT_CHECK(cnrtPlaceNotifier(end, queue));
+    cnrtQueueSync(queue);
+
+    //---------------------------
+    CNRT_CHECK(cnrtMemcpy(host_indices, mlu_indices, sizeof(int), cnrtMemcpyDevToHost));
+    
+    float timeTotal;
+    CNRT_CHECK(cnrtNotifierDuration(start, end, &timeTotal));
+    printf("Total Time: %.3f ms\n", timeTotal / 1000.0);
+
+    CNRT_CHECK(cnrtQueueDestroy(queue));
+
+    
+    printf("%d ", host_indices[0]);
+    printf("\n");
+    cnrtFree(mlu_source);
+    cnrtFree(mlu_indices);
+    
+    
+    free(host_source);
+    free(host_indices);
+
+    return 0;
+}     
+
+
+
+
+
+
+
