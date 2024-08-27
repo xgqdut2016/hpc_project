@@ -133,8 +133,8 @@ void hostMatrix(float *hostA, float *hostB, float *hostC, int M, int K, int N)
 int main()
 {
     float *hostA, *hostB, *hostC, *serialC;
-    int M = 1024;
-    int K = 1024;
+    int M = 2048;
+    int K = 512;
     int N = 1024;
 
     hostA = (float *)malloc(M * K * sizeof(float));
@@ -162,4 +162,3 @@ int main()
     free(serialC);
     return 0;
 }
-
