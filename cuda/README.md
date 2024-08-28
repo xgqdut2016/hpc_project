@@ -35,3 +35,16 @@ cuda core和tensor core实现matmul
 然后使用./jacobi计算
 
 最后使用make clean，此时可以把之前产生的中间文件全部清除
+
+## minres
+稀疏矩阵结合minres求解线性系统，参考链接https://blog.csdn.net/forrestguang/article/details/128291289
+
+代码运行顺序如下所示：
+
+首先make create，这个命令会生成稀疏矩阵，右端项，以及精确解
+
+然后使用make，这个命令会根据算法生成可执行文件minres
+
+然后使用./minres计算
+
+最后使用make clean，此时可以把之前产生的中间文件全部清除
