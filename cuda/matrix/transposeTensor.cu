@@ -12,7 +12,7 @@ const int warpSize = 32;
 const int warpNum = BLOCK_DIM_x * BLOCK_DIM_y / warpSize;
 const int warpX = (warpNum == 1 ? 1 : 2);
 const int warpY = warpNum / warpX;
-// 转置kernel暂时有问题，目前求解的是[N,d]@[d,N]的矩阵乘法
+
 __global__ void row_wmma_ker(float *dA, float *dB, float *dC, int M, int K, int N)
 {
     int lda = K; // A=[M,K],索引(x,y) = x * K + y，列优先原则索引(x,y) = y * M + x
@@ -165,7 +165,16 @@ __global__ void wmmashareRowMatmul(float *dA, float *dB, float *dC, int M, int K
     int ldcGlobal = N;
     wmma::store_matrix_sync(dC + cRowGlobal * ldcGlobal + cColGlobal, c_frag, ldcGlobal, wmma::mem_row_major);
 }
-
+__global__ void tranKernel(float *dB, float *dtB, int N, int d)
+{
+    int ind = threadIdx.x + blockIdx.x * blockDim.x; // i * d + j
+    if (ind < N * d)
+    {
+        int j = ind % d;
+        int i = ind / d;
+        dtB[j * N + i] = dB[ind]; // 必须使用额外的向量dtB来存储结果，如果dB既想当input，又当output，会出现内存踩踏导致结果报错
+    }
+}
 double get_walltime()
 {
     struct timeval tp;
@@ -182,7 +191,7 @@ void matrixSerial(float *hostA, float *hostB, float *hostC, int N, int d)
             tmp = 0;
             for (int s = 0; s < d; s++)
             {
-                tmp += hostA[i * d + s] * hostB[s * N + j];
+                tmp += hostA[i * d + s] * hostB[j * d + s];
             }
             hostC[i * N + j] = tmp;
         }
@@ -220,19 +229,32 @@ void hostMatrix(float *hostA, float *hostB, float *hostC, int N, int d)
 
     cudaEvent_t start, stop;
     float ker_time = 0;
-
-    // row_wmma_ker<<<grid_dim, block_dim>>>(dA, dB, dC, N, d, N);
-    wmmaRowMatmul<<<grid_dim, block_dim>>>(dA, dB, dC, N, d, N);
-    // wmmashareRowMatmul<<<grid_dim, block_dim>>>(dA, dB, dC, N, d, N);
+    float *dtB;
+    cudaMalloc((void **)&dtB, N * d * sizeof(float));
+    tranKernel<<<(N * d + 1023) / 1024, 1024>>>(dB, dtB, N, d);
+    // cudaDeviceSynchronize();
+    //  cudaMemcpy(hostB, dtB, N * d * sizeof(float), cudaMemcpyDeviceToHost);
+    //  for (int i = 0; i < N * d; i++)
+    //  {
+    //      printf("%.2f ", hostB[i]);
+    //      if ((i + 1) % N == 0)
+    //      {
+    //          printf("\n");
+    //      }
+    //  }
+    //  printf("\n");
+    // row_wmma_ker<<<grid_dim, block_dim>>>(dA, dtB, dC, N, d, N);
+    // wmmaRowMatmul<<<grid_dim, block_dim>>>(dA, dtB, dC, N, d, N);
+    wmmashareRowMatmul<<<grid_dim, block_dim>>>(dA, dB, dC, N, d, N);
     int repeat = 20;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, 0);
     for (int i = 0; i < repeat; i++)
     {
-        // row_wmma_ker<<<grid_dim, block_dim>>>(dA, dB, dC, N, d, N);
-        wmmaRowMatmul<<<grid_dim, block_dim>>>(dA, dB, dC, N, d, N);
-        // wmmashareRowMatmul<<<grid_dim, block_dim>>>(dA, dB, dC, N, d, N);
+        // row_wmma_ker<<<grid_dim, block_dim>>>(dA, dtB, dC, N, d, N);
+        //  wmmaRowMatmul<<<grid_dim, block_dim>>>(dA, dtB, dC, N, d, N);
+        wmmashareRowMatmul<<<grid_dim, block_dim>>>(dA, dtB, dC, N, d, N);
     }
 
     cudaEventRecord(stop, 0);
@@ -244,6 +266,7 @@ void hostMatrix(float *hostA, float *hostB, float *hostC, int N, int d)
     cudaFree(dA);
     cudaFree(dB);
     cudaFree(dC);
+    cudaFree(dtB);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     ela = get_walltime() - st;
@@ -270,6 +293,15 @@ int main()
         hostA[i] = i % 3;
         hostB[i] = i % 3;
     }
+    // for (int i = 0; i < N * d; i++)
+    // {
+    //     printf("%.2f ", hostB[i]);
+    //     if ((i + 1) % d == 0)
+    //     {
+    //         printf("\n");
+    //     }
+    // }
+    // printf("\n");
     double st, ela;
     st = get_walltime();
     matrixSerial(hostA, hostB, serialC, N, d);
