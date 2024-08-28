@@ -4,4 +4,6 @@ matmul_tensor_core.cu：这个代码展示一般形式的tensor core计算C=AB
 
 tensorcore.cu：这个代码详细介绍了tensor core计算C=AB的内部机理
 
-transposeTensor.cu：这个代码展示tensor core如何计算C=AB.T
+transposeTensor.cu：这个代码展示tensor core借助额外的内存如何计算C=AB.T
+
+tranmat.cu：这个代码展示tensor core如何计算C=AB.T
