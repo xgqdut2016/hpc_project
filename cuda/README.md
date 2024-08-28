@@ -19,3 +19,6 @@ cuda core和tensor core实现matmul
 
 ## jacobi
 九点差分格式的jacobi迭代求解，这个文件夹直接使用make命令就可以自动编译生成可执行文件
+
+## MG
+多重网格算法求解数值PDE
